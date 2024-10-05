@@ -16,72 +16,72 @@
 #define FDPOLLERR (POLLERR | POLLHUP | POLLNVAL)
 
 static int
-get_last_valid_idx(struct fdset *pfdset, int last_valid_idx)
+get_last_valid_idx(struct fd_set *pfd_set, int last_valid_idx)
 {
 	int i;
 
-	for (i = last_valid_idx; i >= 0 && pfdset->fd[i].fd == -1; i--)
+	for (i = last_valid_idx; i >= 0 && pfd_set->fd[i].fd == -1; i--)
 		;
 
 	return i;
 }
 
 static void
-fdset_move(struct fdset *pfdset, int dst, int src)
+fd_set_move(struct fd_set *pfd_set, int dst, int src)
 {
-	pfdset->fd[dst]    = pfdset->fd[src];
-	pfdset->rwfds[dst] = pfdset->rwfds[src];
+	pfd_set->fd[dst]    = pfd_set->fd[src];
+	pfd_set->rwfds[dst] = pfd_set->rwfds[src];
 }
 
 static void
-fdset_shrink_nolock(struct fdset *pfdset)
+fd_set_shrink_nolock(struct fd_set *pfd_set)
 {
 	int i;
-	int last_valid_idx = get_last_valid_idx(pfdset, pfdset->num - 1);
+	int last_valid_idx = get_last_valid_idx(pfd_set, pfd_set->num - 1);
 
 	for (i = 0; i < last_valid_idx; i++) {
-		if (pfdset->fd[i].fd != -1)
+		if (pfd_set->fd[i].fd != -1)
 			continue;
 
-		fdset_move(pfdset, i, last_valid_idx);
-		last_valid_idx = get_last_valid_idx(pfdset, last_valid_idx - 1);
+		fd_set_move(pfd_set, i, last_valid_idx);
+		last_valid_idx = get_last_valid_idx(pfd_set, last_valid_idx - 1);
 	}
-	pfdset->num = last_valid_idx + 1;
+	pfd_set->num = last_valid_idx + 1;
 }
 
 /*
  * Find deleted fd entries and remove them
  */
 static void
-fdset_shrink(struct fdset *pfdset)
+fd_set_shrink(struct fd_set *pfd_set)
 {
-	pthread_mutex_lock(&pfdset->fd_mutex);
-	fdset_shrink_nolock(pfdset);
-	pthread_mutex_unlock(&pfdset->fd_mutex);
+	pthread_mutex_lock(&pfd_set->fd_mutex);
+	fd_set_shrink_nolock(pfd_set);
+	pthread_mutex_unlock(&pfd_set->fd_mutex);
 }
 
 /**
- * Returns the index in the fdset for a given fd.
+ * Returns the index in the fd_set for a given fd.
  * @return
- *   index for the fd, or -1 if fd isn't in the fdset.
+ *   index for the fd, or -1 if fd isn't in the fd_set.
  */
 static int
-fdset_find_fd(struct fdset *pfdset, int fd)
+fd_set_find_fd(struct fd_set *pfd_set, int fd)
 {
 	int i;
 
-	for (i = 0; i < pfdset->num && pfdset->fd[i].fd != fd; i++)
+	for (i = 0; i < pfd_set->num && pfd_set->fd[i].fd != fd; i++)
 		;
 
-	return i == pfdset->num ? -1 : i;
+	return i == pfd_set->num ? -1 : i;
 }
 
 static void
-fdset_add_fd(struct fdset *pfdset, int idx, int fd,
+fd_set_add_fd(struct fd_set *pfd_set, int idx, int fd,
 	fd_cb rcb, fd_cb wcb, void *dat)
 {
-	struct fdentry *pfdentry = &pfdset->fd[idx];
-	struct pollfd *pfd = &pfdset->rwfds[idx];
+	struct fdentry *pfdentry = &pfd_set->fd[idx];
+	struct pollfd *pfd = &pfd_set->rwfds[idx];
 
 	pfdentry->fd  = fd;
 	pfdentry->rcb = rcb;
@@ -95,125 +95,125 @@ fdset_add_fd(struct fdset *pfdset, int idx, int fd,
 }
 
 void
-fdset_init(struct fdset *pfdset)
+fd_set_init(struct fd_set *pfd_set)
 {
 	int i;
 
-	if (pfdset == NULL)
+	if (pfd_set == NULL)
 		return;
 
 	for (i = 0; i < MAX_FDS; i++) {
-		pfdset->fd[i].fd = -1;
-		pfdset->fd[i].dat = NULL;
+		pfd_set->fd[i].fd = -1;
+		pfd_set->fd[i].dat = NULL;
 	}
-	pfdset->num = 0;
+	pfd_set->num = 0;
 }
 
 /**
- * Register the fd in the fdset with read/write handler and context.
+ * Register the fd in the fd_set with read/write handler and context.
  */
 int
-fdset_add(struct fdset *pfdset, int fd, fd_cb rcb, fd_cb wcb, void *dat)
+fd_set_add(struct fd_set *pfd_set, int fd, fd_cb rcb, fd_cb wcb, void *dat)
 {
 	int i;
 
-	if (pfdset == NULL || fd == -1)
+	if (pfd_set == NULL || fd == -1)
 		return -1;
 
-	pthread_mutex_lock(&pfdset->fd_mutex);
-	i = pfdset->num < MAX_FDS ? pfdset->num++ : -1;
+	pthread_mutex_lock(&pfd_set->fd_mutex);
+	i = pfd_set->num < MAX_FDS ? pfd_set->num++ : -1;
 	if (i == -1) {
-		pthread_mutex_lock(&pfdset->fd_pooling_mutex);
-		fdset_shrink_nolock(pfdset);
-		pthread_mutex_unlock(&pfdset->fd_pooling_mutex);
-		i = pfdset->num < MAX_FDS ? pfdset->num++ : -1;
+		pthread_mutex_lock(&pfd_set->fd_pooling_mutex);
+		fd_set_shrink_nolock(pfd_set);
+		pthread_mutex_unlock(&pfd_set->fd_pooling_mutex);
+		i = pfd_set->num < MAX_FDS ? pfd_set->num++ : -1;
 		if (i == -1) {
-			pthread_mutex_unlock(&pfdset->fd_mutex);
+			pthread_mutex_unlock(&pfd_set->fd_mutex);
 			return -2;
 		}
 	}
 
-	fdset_add_fd(pfdset, i, fd, rcb, wcb, dat);
-	pthread_mutex_unlock(&pfdset->fd_mutex);
+	fd_set_add_fd(pfd_set, i, fd, rcb, wcb, dat);
+	pthread_mutex_unlock(&pfd_set->fd_mutex);
 
 	return 0;
 }
 
 /**
- *  Unregister the fd from the fdset.
+ *  Unregister the fd from the fd_set.
  *  Returns context of a given fd or NULL.
  */
 void *
-fdset_del(struct fdset *pfdset, int fd)
+fd_set_del(struct fd_set *pfd_set, int fd)
 {
 	int i;
 	void *dat = NULL;
 
-	if (pfdset == NULL || fd == -1)
+	if (pfd_set == NULL || fd == -1)
 		return NULL;
 
 	do {
-		pthread_mutex_lock(&pfdset->fd_mutex);
+		pthread_mutex_lock(&pfd_set->fd_mutex);
 
-		i = fdset_find_fd(pfdset, fd);
-		if (i != -1 && pfdset->fd[i].busy == 0) {
+		i = fd_set_find_fd(pfd_set, fd);
+		if (i != -1 && pfd_set->fd[i].busy == 0) {
 			/* busy indicates r/wcb is executing! */
-			dat = pfdset->fd[i].dat;
-			pfdset->fd[i].fd = -1;
-			pfdset->fd[i].rcb = pfdset->fd[i].wcb = NULL;
-			pfdset->fd[i].dat = NULL;
+			dat = pfd_set->fd[i].dat;
+			pfd_set->fd[i].fd = -1;
+			pfd_set->fd[i].rcb = pfd_set->fd[i].wcb = NULL;
+			pfd_set->fd[i].dat = NULL;
 			i = -1;
 		}
-		pthread_mutex_unlock(&pfdset->fd_mutex);
+		pthread_mutex_unlock(&pfd_set->fd_mutex);
 	} while (i != -1);
 
 	return dat;
 }
 
 /**
- *  Unregister the fd from the fdset.
+ *  Unregister the fd from the fd_set.
  *
  *  If parameters are invalid, return directly -2.
  *  And check whether fd is busy, if yes, return -1.
- *  Otherwise, try to delete the fd from fdset and
+ *  Otherwise, try to delete the fd from fd_set and
  *  return true.
  */
 int
-fdset_try_del(struct fdset *pfdset, int fd)
+fd_set_try_del(struct fd_set *pfd_set, int fd)
 {
 	int i;
 
-	if (pfdset == NULL || fd == -1)
+	if (pfd_set == NULL || fd == -1)
 		return -2;
 
-	pthread_mutex_lock(&pfdset->fd_mutex);
-	i = fdset_find_fd(pfdset, fd);
-	if (i != -1 && pfdset->fd[i].busy) {
-		pthread_mutex_unlock(&pfdset->fd_mutex);
+	pthread_mutex_lock(&pfd_set->fd_mutex);
+	i = fd_set_find_fd(pfd_set, fd);
+	if (i != -1 && pfd_set->fd[i].busy) {
+		pthread_mutex_unlock(&pfd_set->fd_mutex);
 		return -1;
 	}
 
 	if (i != -1) {
-		pfdset->fd[i].fd = -1;
-		pfdset->fd[i].rcb = pfdset->fd[i].wcb = NULL;
-		pfdset->fd[i].dat = NULL;
+		pfd_set->fd[i].fd = -1;
+		pfd_set->fd[i].rcb = pfd_set->fd[i].wcb = NULL;
+		pfd_set->fd[i].dat = NULL;
 	}
 
-	pthread_mutex_unlock(&pfdset->fd_mutex);
+	pthread_mutex_unlock(&pfd_set->fd_mutex);
 	return 0;
 }
 
 /**
  * This functions runs in infinite blocking loop until there is no fd in
- * pfdset. It calls corresponding r/w handler if there is event on the fd.
+ * pfd_set. It calls corresponding r/w handler if there is event on the fd.
  *
  * Before the callback is called, we set the flag to busy status; If other
- * thread(now rte_vhost_driver_unregister) calls fdset_del concurrently, it
+ * thread(now rte_vhost_driver_unregister) calls fd_set_del concurrently, it
  * will wait until the flag is reset to zero(which indicates the callback is
- * finished), then it could free the context after fdset_del.
+ * finished), then it could free the context after fd_set_del.
  */
 uint32_t
-fdset_event_dispatch(void *arg)
+fd_set_event_dispatch(void *arg)
 {
 	int i;
 	struct pollfd *pfd;
@@ -223,47 +223,47 @@ fdset_event_dispatch(void *arg)
 	int fd, numfds;
 	int remove1, remove2;
 	int need_shrink;
-	struct fdset *pfdset = arg;
+	struct fd_set *pfd_set = arg;
 	int val;
 
-	if (pfdset == NULL)
+	if (pfd_set == NULL)
 		return 0;
 
 	while (1) {
 
 		/*
 		 * When poll is blocked, other threads might unregister
-		 * listenfds from and register new listenfds into fdset.
-		 * When poll returns, the entries for listenfds in the fdset
+		 * listenfds from and register new listenfds into fd_set.
+		 * When poll returns, the entries for listenfds in the fd_set
 		 * might have been updated. It is ok if there is unwanted call
 		 * for new listenfds.
 		 */
-		pthread_mutex_lock(&pfdset->fd_mutex);
-		numfds = pfdset->num;
-		pthread_mutex_unlock(&pfdset->fd_mutex);
+		pthread_mutex_lock(&pfd_set->fd_mutex);
+		numfds = pfd_set->num;
+		pthread_mutex_unlock(&pfd_set->fd_mutex);
 
-		pthread_mutex_lock(&pfdset->fd_pooling_mutex);
-		val = poll(pfdset->rwfds, numfds, 1000 /* millisecs */);
-		pthread_mutex_unlock(&pfdset->fd_pooling_mutex);
+		pthread_mutex_lock(&pfd_set->fd_pooling_mutex);
+		val = poll(pfd_set->rwfds, numfds, 1000 /* millisecs */);
+		pthread_mutex_unlock(&pfd_set->fd_pooling_mutex);
 		if (val < 0)
 			continue;
 
 		need_shrink = 0;
 		for (i = 0; i < numfds; i++) {
-			pthread_mutex_lock(&pfdset->fd_mutex);
+			pthread_mutex_lock(&pfd_set->fd_mutex);
 
-			pfdentry = &pfdset->fd[i];
+			pfdentry = &pfd_set->fd[i];
 			fd = pfdentry->fd;
-			pfd = &pfdset->rwfds[i];
+			pfd = &pfd_set->rwfds[i];
 
 			if (fd < 0) {
 				need_shrink = 1;
-				pthread_mutex_unlock(&pfdset->fd_mutex);
+				pthread_mutex_unlock(&pfd_set->fd_mutex);
 				continue;
 			}
 
 			if (!pfd->revents) {
-				pthread_mutex_unlock(&pfdset->fd_mutex);
+				pthread_mutex_unlock(&pfd_set->fd_mutex);
 				continue;
 			}
 
@@ -274,7 +274,7 @@ fdset_event_dispatch(void *arg)
 			dat = pfdentry->dat;
 			pfdentry->busy = 1;
 
-			pthread_mutex_unlock(&pfdset->fd_mutex);
+			pthread_mutex_unlock(&pfd_set->fd_mutex);
 
 			if (rcb && pfd->revents & (POLLIN | FDPOLLERR))
 				rcb(fd, dat, &remove1);
@@ -282,16 +282,16 @@ fdset_event_dispatch(void *arg)
 				wcb(fd, dat, &remove2);
 			pfdentry->busy = 0;
 			/*
-			 * fdset_del needs to check busy flag.
-			 * We don't allow fdset_del to be called in callback
+			 * fd_set_del needs to check busy flag.
+			 * We don't allow fd_set_del to be called in callback
 			 * directly.
 			 */
 			/*
-			 * When we are to clean up the fd from fdset,
+			 * When we are to clean up the fd from fd_set,
 			 * because the fd is closed in the cb,
 			 * the old fd val could be reused by when creates new
 			 * listen fd in another thread, we couldn't call
-			 * fdset_del.
+			 * fd_set_del.
 			 */
 			if (remove1 || remove2) {
 				pfdentry->fd = -1;
@@ -300,18 +300,18 @@ fdset_event_dispatch(void *arg)
 		}
 
 		if (need_shrink)
-			fdset_shrink(pfdset);
+			fd_set_shrink(pfd_set);
 	}
 
 	return 0;
 }
 
 static void
-fdset_pipe_read_cb(int readfd, void *dat,
+fd_set_pipe_read_cb(int readfd, void *dat,
 		   int *remove __rte_unused)
 {
 	char charbuf[16];
-	struct fdset *fdset = dat;
+	struct fd_set *fd_set = dat;
 	int r = read(readfd, charbuf, sizeof(charbuf));
 	/*
 	 * Just an optimization, we don't care if read() failed
@@ -320,40 +320,40 @@ fdset_pipe_read_cb(int readfd, void *dat,
 	 */
 	RTE_SET_USED(r);
 
-	pthread_mutex_lock(&fdset->sync_mutex);
-	fdset->sync = true;
-	pthread_cond_broadcast(&fdset->sync_cond);
-	pthread_mutex_unlock(&fdset->sync_mutex);
+	pthread_mutex_lock(&fd_set->sync_mutex);
+	fd_set->sync = true;
+	pthread_cond_broadcast(&fd_set->sync_cond);
+	pthread_mutex_unlock(&fd_set->sync_mutex);
 }
 
 void
-fdset_pipe_uninit(struct fdset *fdset)
+fd_set_pipe_uninit(struct fd_set *fd_set)
 {
-	fdset_del(fdset, fdset->u.readfd);
-	close(fdset->u.readfd);
-	close(fdset->u.writefd);
+	fd_set_del(fd_set, fd_set->u.readfd);
+	close(fd_set->u.readfd);
+	close(fd_set->u.writefd);
 }
 
 int
-fdset_pipe_init(struct fdset *fdset)
+fd_set_pipe_init(struct fd_set *fd_set)
 {
 	int ret;
 
-	if (pipe(fdset->u.pipefd) < 0) {
+	if (pipe(fd_set->u.pipefd) < 0) {
 		RTE_LOG(ERR, VHOST_FDMAN,
-			"failed to create pipe for vhost fdset\n");
+			"failed to create pipe for vhost fd_set\n");
 		return -1;
 	}
 
-	ret = fdset_add(fdset, fdset->u.readfd,
-			fdset_pipe_read_cb, NULL, fdset);
+	ret = fd_set_add(fd_set, fd_set->u.readfd,
+			fd_set_pipe_read_cb, NULL, fd_set);
 
 	if (ret < 0) {
 		RTE_LOG(ERR, VHOST_FDMAN,
-			"failed to add pipe readfd %d into vhost server fdset\n",
-			fdset->u.readfd);
+			"failed to add pipe readfd %d into vhost server fd_set\n",
+			fd_set->u.readfd);
 
-		fdset_pipe_uninit(fdset);
+		fd_set_pipe_uninit(fd_set);
 		return -1;
 	}
 
@@ -361,9 +361,9 @@ fdset_pipe_init(struct fdset *fdset)
 }
 
 void
-fdset_pipe_notify(struct fdset *fdset)
+fd_set_pipe_notify(struct fd_set *fd_set)
 {
-	int r = write(fdset->u.writefd, "1", 1);
+	int r = write(fd_set->u.writefd, "1", 1);
 	/*
 	 * Just an optimization, we don't care if write() failed
 	 * so ignore explicitly its return value to make the
@@ -373,15 +373,15 @@ fdset_pipe_notify(struct fdset *fdset)
 }
 
 void
-fdset_pipe_notify_sync(struct fdset *fdset)
+fd_set_pipe_notify_sync(struct fd_set *fd_set)
 {
-	pthread_mutex_lock(&fdset->sync_mutex);
+	pthread_mutex_lock(&fd_set->sync_mutex);
 
-	fdset->sync = false;
-	fdset_pipe_notify(fdset);
+	fd_set->sync = false;
+	fd_set_pipe_notify(fd_set);
 
-	while (!fdset->sync)
-		pthread_cond_wait(&fdset->sync_cond, &fdset->sync_mutex);
+	while (!fd_set->sync)
+		pthread_cond_wait(&fd_set->sync_cond, &fd_set->sync_mutex);
 
-	pthread_mutex_unlock(&fdset->sync_mutex);
+	pthread_mutex_unlock(&fd_set->sync_mutex);
 }

@@ -46,7 +46,7 @@ static int
 eth_dev_start(struct rte_eth_dev *eth_dev)
 {
 	struct pmd_internal *internal = eth_dev->data->dev_private;
-	struct rte_eth_conf *dev_conf = &eth_dev->data->dev_conf;
+	// struct rte_eth_conf *dev_conf = &eth_dev->data->dev_conf;
 	uint16_t i;
 
 	rte_atomic16_set(&internal->started, 1);
@@ -66,7 +66,7 @@ eth_dev_stop(struct rte_eth_dev *dev)
 	uint16_t i;
 
 	dev->data->dev_started = 0;
-	rte_atomic32_set(&internal->started, 0);
+	rte_atomic16_set(&internal->started, 0);
 
 	for (i = 0; i < dev->data->nb_rx_queues; i++)
 		dev->data->rx_queue_state[i] = RTE_ETH_QUEUE_STATE_STOPPED;
@@ -80,28 +80,28 @@ static int
 eth_dev_close(struct rte_eth_dev *dev)
 {
 	struct pmd_internal *internal;
-	unsigned int i, ret;
+	int ret;
 
 	internal = dev->data->dev_private;
 	if (!internal)
 		return 0;
 	
-	// fdset_try_del(internal->fdset, internal->memctl_fd);
+	// fd_set_try_del(internal->fd_set, internal->memctl_fd);
 	if(internal->server) {
-		ret = fdset_try_del(&internal->fdset, 
+		ret = fd_set_try_del(&internal->fd_set, 
 			internal->unix_sock[TYPE_SERVER_2_CLIENT].sock_fd);
 		while(ret == -1) {
 			usleep(100);
-			ret = fdset_try_del(&internal->fdset, 
+			ret = fd_set_try_del(&internal->fd_set, 
 				internal->unix_sock[TYPE_SERVER_2_CLIENT].sock_fd);
 		}
 		close(internal->unix_sock[TYPE_SERVER_2_CLIENT].sock_fd);
 	}else {
-		ret = fdset_try_del(&internal->fdset, 
+		ret = fd_set_try_del(&internal->fd_set, 
 			internal->unix_sock[TYPE_CLIENT_2_SERVER].sock_fd);
 		while(ret == -1) {
 			usleep(100);
-			ret = fdset_try_del(&internal->fdset, 
+			ret = fd_set_try_del(&internal->fd_set, 
 				internal->unix_sock[TYPE_CLIENT_2_SERVER].sock_fd);
 		}
 		close(internal->unix_sock[TYPE_CLIENT_2_SERVER].sock_fd);
@@ -111,7 +111,7 @@ eth_dev_close(struct rte_eth_dev *dev)
 				if(is_bit_set(internal->guest_mem.invalid_mask, i))
 					continue;
 				else {
-					munmap(internal->guest_mem.regions[i].satrt_addr, 
+					munmap((void*)internal->guest_mem.regions[i].satrt_addr, 
 						internal->guest_mem.regions[i].memory_size);
 					close(internal->guest_mem.fds[i]);
 				}
@@ -186,24 +186,23 @@ zcio_start_server(struct rte_eth_dev *dev)
 	
 	struct zcio_socket *client_sock = &(internal->unix_sock[TYPE_SERVER_2_CLIENT]);
 	int client_fd;
-	client_fd = accept(fd, (struct sockaddr *)&client_sock->un, 
-					sizeof(struct sockaddr_un));
+	client_fd = accept(fd, (struct sockaddr *)&client_sock->un, NULL);
 	if (client_fd < 0)
 		goto out_free_fd;
 
 	ZCIO_LOG(INFO, "[%s] new zcio connection is %d\n",internal->server_iface, client_fd);
-	ret = fdset_add(&internal->fdset, client_fd, zcio_server_msg_handler,
+	ret = fd_set_add(&internal->fd_set, client_fd, zcio_server_msg_handler,
 			NULL, dev);
 	if (ret < 0) {
-		ZCIO_LOG(ERR, "[%s] failed to add fd %d into zcio server fdset\n", 
+		ZCIO_LOG(ERR, "[%s] failed to add fd %d into zcio server fd_set\n", 
 					internal->server_iface, client_fd);
 		close(client_fd);
 		goto out_free_fd;
 	}
 	
 	client_sock->sock_fd = client_fd;
-	rte_atomic32_set(&internal->attched, 1);
-	fdset_pipe_notify(&internal->fdset);
+	rte_atomic16_set(&internal->attched, 1);
+	fd_set_pipe_notify(&internal->fd_set);
 	
 	close(fd);
 	return 0;
@@ -262,16 +261,16 @@ static int client_connect_server(struct rte_eth_dev *dev)
 		return ret;
 	
 	sock->sock_fd = server_fd;
-	ret = fdset_add(&internal->fdset, server_fd, zcio_client_msg_handler,
+	ret = fd_set_add(&internal->fd_set, server_fd, zcio_client_msg_handler,
 		  NULL, dev);
 	if (ret < 0) {
-		ZCIO_LOG(ERR, "client2server_fd %d faild to be added into fdset\n",
+		ZCIO_LOG(ERR, "client2server_fd %d faild to be added into fd_set\n",
 			server_fd);
 		close(server_fd);
 		return -1;
 	}
 	ZCIO_LOG(INFO, "CLIENT_2_SERVER connect succeeded\n");
-	rte_atomic32_set(&internal->attched, 1);
+	rte_atomic16_set(&internal->attched, 1);
 	return 0;
 }
 
@@ -352,9 +351,9 @@ zcio_start_client(struct rte_eth_dev *dev)
 			set_bit(invalid_mask, i);
 			continue;
 		}
-		regions[i].satrt_addr = mmap(NULL, fd_state.st_size, 
+		regions[i].satrt_addr = (uint64_t)mmap(NULL, fd_state.st_size, 
 					(PROT_READ|PROT_WRITE), MAP_SHARED, fds[i], 0);
-		if (regions[i].satrt_addr == MAP_FAILED) {
+		if (regions[i].satrt_addr == (uint64_t)MAP_FAILED) {
 			ZCIO_LOG(ERR, "failed to mmap fd %d: %s\n", fds[i], strerror(errno));
 			close(fds[i]);
 			set_bit(invalid_mask, i);
@@ -392,21 +391,20 @@ static int
 eth_dev_configure(struct rte_eth_dev *dev)
 {
 	struct pmd_internal *internal = dev->data->dev_private;
-	int ret;
 	
 	// 创建轮询线程，处理文件描述符集合的读写回调函数
-	static rte_thread_t fdset_tid;
-	if (fdset_tid.opaque_id == 0) {
-		if (fdset_pipe_init(&internal->fdset) < 0) {
-			ZCIO_LOG(ERR, "failed to create pipe for zcio fdset\n");
+	static rte_thread_t fd_set_tid;
+	if (fd_set_tid.opaque_id == 0) {
+		if (fd_set_pipe_init(&internal->fd_set) < 0) {
+			ZCIO_LOG(ERR, "failed to create pipe for zcio fd_set\n");
 			return -1;
 		}
 
-		int ret = rte_thread_create_internal_control(&fdset_tid,
-				"zcio-evt", fdset_event_dispatch, &internal->fdset);
+		int ret = rte_thread_create_internal_control(&fd_set_tid,
+				"zcio-evt", fd_set_event_dispatch, &internal->fd_set);
 		if (ret != 0) {
-			ZCIO_LOG(ERR, "failed to create fdset handling thread\n");
-			fdset_pipe_uninit(&internal->fdset);
+			ZCIO_LOG(ERR, "failed to create fd_set handling thread\n");
+			fd_set_pipe_uninit(&internal->fd_set);
 			return -1;
 		}
 	}
@@ -459,7 +457,7 @@ eth_link_update(struct rte_eth_dev *dev __rte_unused,
 static int
 zcio_dev_priv_dump(struct rte_eth_dev *dev, FILE *f)
 {
-	struct pmd_internal *internal = dev->data->dev_private;
+	// struct pmd_internal *internal = dev->data->dev_private;
 
 	return 0;
 }
@@ -614,7 +612,7 @@ parse_kvargs(struct rte_kvargs *kvlist, const char *key_match,
     if(ret != 1)
         return -1;
     
-    ret = rte_kvargs_process(kvlist, key_match, &handler, opaque);
+    ret = rte_kvargs_process(kvlist, key_match, handler, opaque);
     if(ret < 0) 
         return ret;
     
@@ -630,7 +628,6 @@ rte_pmd_zcio_probe(struct rte_vdev_device *dev)
     int server = 1;
     int queues = 1;
 	int ret = 0;
-	struct rte_eth_dev *eth_dev;
 	const char *name = rte_vdev_device_name(dev);
 
 	ZCIO_LOG(INFO, "Initializing pmd_zcio for %s\n", name);
@@ -672,7 +669,7 @@ rte_pmd_zcio_probe(struct rte_vdev_device *dev)
 	if (dev->device.numa_node == SOCKET_ID_ANY)
 		dev->device.numa_node = rte_socket_id();
 
-	ret = eth_dev_zcio_create(dev, server, memctl_iface, queues,
+	ret = eth_dev_zcio_create(dev, server, queues, memctl_iface,
                 dev->device.numa_node, server_iface);
 	if (ret < 0)
 		ZCIO_LOG(ERR, "Failed to create %s\n", name);

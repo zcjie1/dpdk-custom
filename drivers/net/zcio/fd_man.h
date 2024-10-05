@@ -20,12 +20,12 @@ struct fdentry {
 	int busy;	/* whether this entry is being used in cb. */
 };
 
-struct fdset {
+struct fd_set {
 	struct pollfd rwfds[MAX_FDS];
 	struct fdentry fd[MAX_FDS];
 	pthread_mutex_t fd_mutex;
 	pthread_mutex_t fd_pooling_mutex;
-	int num;	/* current fd number of this fdset */
+	int num;	/* current fd number of this fd_set */
 
 	union pipefds {
 		struct {
@@ -43,21 +43,21 @@ struct fdset {
 };
 
 
-void fdset_init(struct fdset *pfdset);
+void fd_set_init(struct fd_set *pfd_set);
 
-int fdset_add(struct fdset *pfdset, int fd,
+int fd_set_add(struct fd_set *pfd_set, int fd,
 	fd_cb rcb, fd_cb wcb, void *dat);
 
-void *fdset_del(struct fdset *pfdset, int fd);
-int fdset_try_del(struct fdset *pfdset, int fd);
+void *fd_set_del(struct fd_set *pfd_set, int fd);
+int fd_set_try_del(struct fd_set *pfd_set, int fd);
 
-uint32_t fdset_event_dispatch(void *arg);
+uint32_t fd_set_event_dispatch(void *arg);
 
-int fdset_pipe_init(struct fdset *fdset);
+int fd_set_pipe_init(struct fd_set *fd_set);
 
-void fdset_pipe_uninit(struct fdset *fdset);
+void fd_set_pipe_uninit(struct fd_set *fd_set);
 
-void fdset_pipe_notify(struct fdset *fdset);
-void fdset_pipe_notify_sync(struct fdset *fdset);
+void fd_set_pipe_notify(struct fd_set *fd_set);
+void fd_set_pipe_notify_sync(struct fd_set *fd_set);
 
 #endif

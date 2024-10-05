@@ -53,7 +53,7 @@ struct pmd_internal {
     char *server_iface; // rte_malloc'd
     char *memctl_iface; // rte_malloc'd
 	struct zcio_socket unix_sock[TYPE_NUM];
-	struct fdset fdset;
+	struct fd_set fd_set;
 	struct meminfo host_mem;
 	struct meminfo guest_mem;
 };

@@ -1610,7 +1610,6 @@ rte_pmd_vhost_probe(struct rte_vdev_device *dev)
 	int linear_buf = 0;
 	int ext_buf = 0;
 	int legacy_ol_flags = 0;
-	int zero_copy = 0;
 	struct rte_eth_dev *eth_dev;
 	const char *name = rte_vdev_device_name(dev);
 
