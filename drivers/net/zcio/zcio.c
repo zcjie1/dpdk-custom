@@ -1,10 +1,12 @@
 
 #include <stdio.h>
-#include <stdint.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 
 #include <rte_log.h>
 #include <rte_bus_vdev.h>
@@ -83,6 +85,39 @@ eth_dev_close(struct rte_eth_dev *dev)
 	internal = dev->data->dev_private;
 	if (!internal)
 		return 0;
+	
+	// fdset_try_del(internal->fdset, internal->memctl_fd);
+	if(internal->server) {
+		ret = fdset_try_del(&internal->fdset, 
+			internal->unix_sock[TYPE_SERVER_2_CLIENT].sock_fd);
+		while(ret == -1) {
+			usleep(100);
+			ret = fdset_try_del(&internal->fdset, 
+				internal->unix_sock[TYPE_SERVER_2_CLIENT].sock_fd);
+		}
+		close(internal->unix_sock[TYPE_SERVER_2_CLIENT].sock_fd);
+	}else {
+		ret = fdset_try_del(&internal->fdset, 
+			internal->unix_sock[TYPE_CLIENT_2_SERVER].sock_fd);
+		while(ret == -1) {
+			usleep(100);
+			ret = fdset_try_del(&internal->fdset, 
+				internal->unix_sock[TYPE_CLIENT_2_SERVER].sock_fd);
+		}
+		close(internal->unix_sock[TYPE_CLIENT_2_SERVER].sock_fd);
+
+		if(internal->guest_mem.region_nr != 0) {
+			for(int i = 0; i < internal->guest_mem.region_nr; i++) {
+				if(is_bit_set(internal->guest_mem.invalid_mask, i))
+					continue;
+				else {
+					munmap(internal->guest_mem.regions[i].satrt_addr, 
+						internal->guest_mem.regions[i].memory_size);
+					close(internal->guest_mem.fds[i]);
+				}
+			}
+		}
+	}
 
 	ret = eth_dev_stop(dev);
 
@@ -90,47 +125,21 @@ eth_dev_close(struct rte_eth_dev *dev)
 	rte_free(internal->memctl_iface);
 	rte_free(internal);
 
-
 	dev->data->dev_private = NULL;
 
 	return ret;
 }
 
 static void
-zcio_msg_handler(int client_fd, void *dat, int *remove) {
+zcio_server_msg_handler(int client_fd, void *dat, int *remove) 
+{
 	return;
 }
 
 static void
-zcio_server_new_connection(int listen_fd, void *dat, int *remove __rte_unused)
+zcio_client_msg_handler(int client_fd, void *dat, int *remove) 
 {
-	struct rte_eth_dev *dev = dat;
-	struct pmd_internal *internal = dev->data->dev_private;
-	struct zcio_socket *client_sock = &(internal->unix_sock[TYPE_SERVER_2_CLIENT]);
-	int client_fd;
-	int ret;
-
-	client_fd = accept(listen_fd, (struct sockaddr *)&client_sock->un, 
-						sizeof(struct sockaddr_un));
-	if (client_fd < 0)
-		return;
-
-	ZCIO_LOG(INFO, "[%s] new zcio connection is %d\n",internal->server_iface, listen_fd);
-	ret = fdset_add(&internal->fdset, client_fd, zcio_msg_handler,
-			NULL, &(internal->unix_sock[TYPE_SERVER_2_CLIENT]));
-	if (ret < 0) {
-		ZCIO_LOG(ERR, "[%s] failed to add fd %d into zcio server fdset\n", 
-					internal->server_iface, client_fd);
-		close(client_fd);
-		return;
-	}
-	
-	client_sock->sock_fd = client_fd;
-	rte_atomic32_set(&internal->attched, 1);
-	fdset_del(&internal->fdset, listen_fd);
-	close(listen_fd);
-
-	fdset_pipe_notify(&internal->fdset);
+	return;
 }
 
 static int
@@ -175,13 +184,29 @@ zcio_start_server(struct rte_eth_dev *dev)
 	if (ret < 0)
 		goto out_free_fd;
 	
-	ret = fdset_add(&internal->fdset, fd, zcio_server_new_connection,
-		  NULL, dev);
+	struct zcio_socket *client_sock = &(internal->unix_sock[TYPE_SERVER_2_CLIENT]);
+	int client_fd;
+	client_fd = accept(fd, (struct sockaddr *)&client_sock->un, 
+					sizeof(struct sockaddr_un));
+	if (client_fd < 0)
+		goto out_free_fd;
+
+	ZCIO_LOG(INFO, "[%s] new zcio connection is %d\n",internal->server_iface, client_fd);
+	ret = fdset_add(&internal->fdset, client_fd, zcio_server_msg_handler,
+			NULL, dev);
 	if (ret < 0) {
-		ZCIO_LOG(ERR, "failed to add listen fd %d to zcio server fdset\n",
-			fd);
+		ZCIO_LOG(ERR, "[%s] failed to add fd %d into zcio server fdset\n", 
+					internal->server_iface, client_fd);
+		close(client_fd);
 		goto out_free_fd;
 	}
+	
+	client_sock->sock_fd = client_fd;
+	rte_atomic32_set(&internal->attched, 1);
+	fdset_pipe_notify(&internal->fdset);
+	
+	close(fd);
+	return 0;
 
  out_free_fd:
 	close(fd);
@@ -190,10 +215,177 @@ zcio_start_server(struct rte_eth_dev *dev)
 	return -1;
 }
 
+static void dump_meminfo(struct meminfo *meminfo)
+{
+	ZCIO_LOG(INFO,"memmory region_nr: %d\n", meminfo->region_nr);
+	for (int i = 0; i < meminfo->region_nr; i++) {
+		if(is_bit_set(meminfo->invalid_mask, i))
+			continue;
+		ZCIO_LOG(INFO, "fd %d region %d: start_addr: %lx, size: %lu\n", 
+			   meminfo->fds[i], i, meminfo->regions[i].satrt_addr, 
+			   meminfo->regions[i].memory_size);
+	}
+}
+
+static int client_connect_server(struct rte_eth_dev *dev)
+{
+	struct pmd_internal *internal = dev->data->dev_private;
+	struct zcio_socket *sock = NULL;
+	struct sockaddr_un *un = NULL;
+	int server_fd = 0;
+	int ret = 0;
+	int reconnect_count = 0;
+
+	// 连接 server 模块
+	sock = &(internal->unix_sock[TYPE_CLIENT_2_SERVER]);
+
+	server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server_fd == -1) {
+        ZCIO_LOG(ERR, "CLIENT_2_SERVER socket creation failed\n");
+        return -1;
+    }
+
+	un = &sock->un;
+	memset(un, 0, sizeof(*un));
+	un->sun_family = AF_UNIX;
+	strncpy(un->sun_path, internal->server_iface, sizeof(un->sun_path) - 1);
+	un->sun_path[sizeof(un->sun_path) - 1] = '\0';
+
+	ret = connect(server_fd, (struct sockaddr *)un, sizeof(*un));
+	while(ret < 0 && reconnect_count < MAX_RECONNECT) {
+		ZCIO_LOG(ERR, "CLIENT_2_SERVER connect failed\n");
+		sleep(2);
+		ret = connect(server_fd, (struct sockaddr *)un, sizeof(*un));
+		reconnect_count++;
+	}
+	if(ret < 0)
+		return ret;
+	
+	sock->sock_fd = server_fd;
+	ret = fdset_add(&internal->fdset, server_fd, zcio_client_msg_handler,
+		  NULL, dev);
+	if (ret < 0) {
+		ZCIO_LOG(ERR, "client2server_fd %d faild to be added into fdset\n",
+			server_fd);
+		close(server_fd);
+		return -1;
+	}
+	ZCIO_LOG(INFO, "CLIENT_2_SERVER connect succeeded\n");
+	rte_atomic32_set(&internal->attched, 1);
+	return 0;
+}
+
 static int
 zcio_start_client(struct rte_eth_dev *dev)
 {
+	struct pmd_internal *internal = dev->data->dev_private;
+	struct zcio_socket *sock = NULL;
+	struct sockaddr_un *un = NULL;
+	struct msghdr msgh;
+    struct iovec iov;
+    struct cmsghdr *cmsg;
+    char control[CMSG_SPACE(MAX_FD_NUM * sizeof(int))];
+	struct stat fd_state;
+	int fd_num = 0;
+	int memctl_fd = 0;
+	int ret = 0;
+	
+	ZCIO_LOG(INFO, "client mode configure\n");
+	
+	// 连接 memctl 模块
+	sock = &(internal->unix_sock[TYPE_CLIENT_2_MEMCTL]);
+	memctl_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (memctl_fd == -1) {
+        ZCIO_LOG(ERR, "CLIENT_2_MEMCTL socket creation failed\n");
+        goto out;
+    }
+
+	un = &sock->un;
+	memset(un, 0, sizeof(*un));
+	un->sun_family = AF_UNIX;
+	strncpy(un->sun_path, internal->memctl_iface, sizeof(un->sun_path) - 1);
+	un->sun_path[sizeof(un->sun_path) - 1] = '\0';
+
+	ret = connect(memctl_fd, (struct sockaddr *)un, sizeof(*un));
+	if(ret < 0) {
+		ZCIO_LOG(ERR, "CLIENT_2_MEMCTL connect failed\n");
+		goto out_free_fd;
+	}
+
+	// 初始化msghdr结构
+    memset(&msgh, 0, sizeof(msgh));
+    msgh.msg_iov = &iov;
+    msgh.msg_iovlen = 1;
+    msgh.msg_control = control;
+    msgh.msg_controllen = sizeof(control);
+
+	// 初始化iov结构
+    iov.iov_base = &internal->host_mem;
+    iov.iov_len = sizeof(internal->host_mem);
+
+	ret = recvmsg(memctl_fd, &msgh, MSG_CMSG_CLOEXEC);
+	if (ret < 0) {
+		ZCIO_LOG(ERR, "CLIENT_2_MEMCTL recvmsg failed\n");
+		goto out_free_fd;
+	}
+
+	for (cmsg = CMSG_FIRSTHDR(&msgh); cmsg != NULL;
+		cmsg = CMSG_NXTHDR(&msgh, cmsg)) {
+		if ((cmsg->cmsg_level == SOL_SOCKET) &&
+			(cmsg->cmsg_type == SCM_RIGHTS)) {
+			fd_num = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+			internal->guest_mem.region_nr = fd_num;
+			memcpy(internal->guest_mem.fds, CMSG_DATA(cmsg), fd_num * sizeof(int));
+			break;
+		}
+	}
+	
+	// 获取内存信息
+	int *fds = internal->guest_mem.fds;
+	struct memory_region *regions = internal->guest_mem.regions;
+	uint64_t *invalid_mask = &internal->guest_mem.invalid_mask;
+	for (int i = 0; i < fd_num; i++) {
+		ret = fstat(fds[i], &fd_state);
+		if(ret) {
+			ZCIO_LOG(ERR, "failed to fstat fd %d\n", fds[i]);
+			close(fds[i]);
+			set_bit(invalid_mask, i);
+			continue;
+		}
+		regions[i].satrt_addr = mmap(NULL, fd_state.st_size, 
+					(PROT_READ|PROT_WRITE), MAP_SHARED, fds[i], 0);
+		if (regions[i].satrt_addr == MAP_FAILED) {
+			ZCIO_LOG(ERR, "failed to mmap fd %d: %s\n", fds[i], strerror(errno));
+			close(fds[i]);
+			set_bit(invalid_mask, i);
+			continue;
+		}
+		regions[i].memory_size = fd_state.st_size;
+		regions[i].mmap_offset = internal->host_mem.regions[i].mmap_offset;
+ 	}
+	
+	ZCIO_LOG(INFO, "host meminfo:\n");
+	dump_meminfo(&internal->host_mem);
+	ZCIO_LOG(INFO, "guest meminfo:\n");
+	dump_meminfo(&internal->guest_mem);
+	
+	// 连接 server
+	ret = client_connect_server(dev);
+	if(ret < 0) {
+		ZCIO_LOG(ERR, "failed to connect to server\n");
+		for(int i = 0; i < fd_num; i++)
+			close(fds[i]);
+		goto out_free_fd;
+	}
+	
+	close(memctl_fd);
 	return 0;
+
+ out_free_fd:
+	close(memctl_fd);
+
+ out:
+	return -1;
 }
 
 static int
@@ -278,14 +470,14 @@ static const struct eth_dev_ops eth_zcio_ops = {
 	.dev_close = eth_dev_close,
 	.dev_configure = eth_dev_configure,
 	.dev_infos_get = eth_dev_info,
-	.rx_queue_setup = eth_rx_queue_setup,
-	.tx_queue_setup = eth_tx_queue_setup,
-	.rx_queue_release = eth_rx_queue_release,
-	.tx_queue_release = eth_tx_queue_release,
+	// .rx_queue_setup = eth_rx_queue_setup,
+	// .tx_queue_setup = eth_tx_queue_setup,
+	// .rx_queue_release = eth_rx_queue_release,
+	// .tx_queue_release = eth_tx_queue_release,
 	.tx_done_cleanup = eth_tx_done_cleanup,
 	.link_update = eth_link_update,
-	.stats_get = eth_stats_get,
-	.stats_reset = eth_stats_reset,
+	// .stats_get = eth_stats_get,
+	// .stats_reset = eth_stats_reset,
 	.eth_dev_priv_dump = zcio_dev_priv_dump,
 };
 
@@ -374,7 +566,6 @@ eth_dev_zcio_create(struct rte_vdev_device *dev, int server, int queues,
 		eth_dev->tx_pkt_burst = eth_zcio_client_tx;
 	}
 	
-
 	rte_eth_dev_probing_finish(eth_dev);
 	return 0;
 
@@ -489,6 +680,26 @@ rte_pmd_zcio_probe(struct rte_vdev_device *dev)
  out_free:
 	rte_kvargs_free(kvlist);
 	return ret;
+}
+
+static int
+rte_pmd_zcio_remove(struct rte_vdev_device *dev)
+{
+	const char *name;
+	struct rte_eth_dev *eth_dev = NULL;
+
+	name = rte_vdev_device_name(dev);
+	ZCIO_LOG(INFO, "Un-Initializing pmd_zcio for %s\n", name);
+
+	/* find an ethdev entry */
+	eth_dev = rte_eth_dev_allocated(name);
+	if (eth_dev == NULL)
+		return 0;
+
+	eth_dev_close(eth_dev);
+	rte_eth_dev_release_port(eth_dev);
+
+	return 0;
 }
 
 static struct rte_vdev_driver pmd_zcio_drv = {
