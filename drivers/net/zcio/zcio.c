@@ -19,8 +19,8 @@
 
 RTE_LOG_REGISTER_DEFAULT(zcio_logtype, INFO);
 
-#define ZCIO_LOG(level, ...) \
-	rte_log(RTE_LOG_ ## level, zcio_logtype, __VA_ARGS__)
+#define ZCIO_LOG(level, fmt, args...) \
+	rte_log(RTE_LOG_ ## level, zcio_logtype, "ZCIO: "fmt, ##args)
 
 #define ETH_ZCIO_SERVER_ARG		        "server"
 #define ETH_ZCIO_SERVER_IFACE_ARG       "server-iface"
@@ -130,7 +130,9 @@ eth_dev_close(struct rte_eth_dev *dev)
 	}
 
 	ret = eth_dev_stop(dev);
-
+	
+	unlink(internal->server_iface);
+	unlink(internal->memctl_iface);
 	rte_free(internal->server_iface);
 	rte_free(internal->memctl_iface);
 	rte_free(internal);
@@ -161,7 +163,7 @@ zcio_start_server(struct rte_eth_dev *dev)
 	int fd = 0;
 	int ret = 0;
 	
-	ZCIO_LOG(INFO, "server mode configure\n");
+	ZCIO_LOG(INFO, "ZCIO server configure\n");
 	sock = &(internal->unix_sock[TYPE_SERVER_LISTENER]);
 	
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -188,7 +190,6 @@ zcio_start_server(struct rte_eth_dev *dev)
 			strerror(errno));
 		goto out_free_fd;
 	}
-	ZCIO_LOG(INFO, "binding succeeded\n");
 
 	ret = listen(fd, 4);
 	if (ret < 0)
@@ -198,11 +199,14 @@ zcio_start_server(struct rte_eth_dev *dev)
 	
 	struct zcio_socket *client_sock = &(internal->unix_sock[TYPE_SERVER_2_CLIENT]);
 	int client_fd;
-	client_fd = accept(fd, (struct sockaddr *)&client_sock->un, NULL);
-	if (client_fd < 0)
+	client_fd = accept(fd, NULL, NULL);
+	if (client_fd < 0) {
+		ZCIO_LOG(ERR, "failed to accept client connection: %s\n",
+			strerror(errno));
 		goto out_free_fd;
-
-	ZCIO_LOG(INFO, "[%s] new zcio connection is %d\n",internal->server_iface, client_fd);
+	}
+		
+	ZCIO_LOG(INFO, "[%s] new zcio connection fd is %d\n",internal->server_iface, client_fd);
 	ret = fd_set_add(&internal->fd_set, client_fd, zcio_server_msg_handler,
 			NULL, dev);
 	if (ret < 0) {
@@ -217,6 +221,7 @@ zcio_start_server(struct rte_eth_dev *dev)
 	fd_set_pipe_notify(&internal->fd_set);
 	
 	close(fd);
+	ZCIO_LOG(INFO, "ZCIO server accept client succeeded\n");
 	return 0;
 
  out_free_fd:
@@ -228,12 +233,12 @@ zcio_start_server(struct rte_eth_dev *dev)
 
 static void dump_meminfo(struct meminfo *meminfo)
 {
-	ZCIO_LOG(INFO,"memmory region_nr: %d\n", meminfo->region_nr);
+	printf(" mem_region num %d\n", meminfo->region_nr);
 	for (int i = 0; i < meminfo->region_nr; i++) {
 		if(is_bit_set(meminfo->invalid_mask, i))
 			continue;
-		ZCIO_LOG(INFO, "fd %d region %d: start_addr: %lx, size: %lu\n", 
-			   meminfo->fds[i], i, meminfo->regions[i].satrt_addr, 
+		printf("	region %d: fd %d, start_addr: %lx, size: %lu\n", 
+			   i, meminfo->fds[i], meminfo->regions[i].satrt_addr, 
 			   meminfo->regions[i].memory_size);
 	}
 }
@@ -246,6 +251,8 @@ static int client_connect_server(struct rte_eth_dev *dev)
 	int server_fd = 0;
 	int ret = 0;
 	int reconnect_count = 0;
+
+	ZCIO_LOG(INFO, "ZCIO client connecting server\n");
 
 	// 连接 server 模块
 	sock = &(internal->unix_sock[TYPE_CLIENT_2_SERVER]);
@@ -301,7 +308,7 @@ zcio_start_client(struct rte_eth_dev *dev)
 	int memctl_fd = 0;
 	int ret = 0;
 	
-	ZCIO_LOG(INFO, "client mode configure\n");
+	ZCIO_LOG(INFO, "ZCIO client mode configure\n");
 	
 	// 连接 memctl 模块
 	sock = &(internal->unix_sock[TYPE_CLIENT_2_MEMCTL]);
@@ -375,10 +382,11 @@ zcio_start_client(struct rte_eth_dev *dev)
 		regions[i].mmap_offset = internal->host_mem.regions[i].mmap_offset;
  	}
 	
-	ZCIO_LOG(INFO, "host meminfo:\n");
+	ZCIO_LOG(INFO, "Host meminfo:");
 	dump_meminfo(&internal->host_mem);
-	ZCIO_LOG(INFO, "guest meminfo:\n");
+	ZCIO_LOG(INFO, "Guest meminfo:");
 	dump_meminfo(&internal->guest_mem);
+	close(memctl_fd);
 	
 	// 连接 server
 	ret = client_connect_server(dev);
@@ -386,10 +394,9 @@ zcio_start_client(struct rte_eth_dev *dev)
 		ZCIO_LOG(ERR, "failed to connect to server\n");
 		for(int i = 0; i < fd_num; i++)
 			close(fds[i]);
-		goto out_free_fd;
+		goto out;
 	}
 	
-	close(memctl_fd);
 	return 0;
 
  out_free_fd:
@@ -525,9 +532,6 @@ eth_dev_zcio_create(struct rte_vdev_device *dev, int server, int queues,
 	struct rte_eth_dev *eth_dev = NULL;
 	struct rte_ether_addr *eth_addr = NULL;
 
-	ZCIO_LOG(INFO, "Creating ZCIO driver on numa socket %u\n",
-		numa_node);
-
 	/* reserve an ethdev entry */
 	eth_dev = rte_eth_vdev_allocate(dev, sizeof(*internal));
 	if (eth_dev == NULL)
@@ -561,7 +565,7 @@ eth_dev_zcio_create(struct rte_vdev_device *dev, int server, int queues,
 	data->nb_rx_queues = queues;
 	data->nb_tx_queues = queues;
 	data->dev_link = pmd_link;
-	data->dev_flags = RTE_ETH_DEV_INTR_LSC;
+	// data->dev_flags = RTE_ETH_DEV_INTR_LSC;
 	data->promiscuous = 1;
 	data->all_multicast = 1;
 
@@ -622,7 +626,7 @@ parse_kvargs(struct rte_kvargs *kvlist, const char *key_match,
     int ret = 0;
     ret = rte_kvargs_count(kvlist, key_match);
     if(ret != 1)
-        return -1;
+		return -1;
     
     ret = rte_kvargs_process(kvlist, key_match, handler, opaque);
     if(ret < 0) 
@@ -642,12 +646,14 @@ rte_pmd_zcio_probe(struct rte_vdev_device *dev)
 	int ret = 0;
 	const char *name = rte_vdev_device_name(dev);
 
-	ZCIO_LOG(INFO, "Initializing pmd_zcio for %s\n", name);
+	ZCIO_LOG(INFO, "Initializing PMD_ZCIO for %s\n", name);
 
 	kvlist = rte_kvargs_parse(rte_vdev_device_args(dev), valid_arguments);
-	if (kvlist == NULL)
+	if (kvlist == NULL) {
+		ZCIO_LOG(ERR, "Invalid parameters for %s\n", name);
 		return -1;
-
+	}
+		
     // 解析 server 参数
     ret = parse_kvargs(kvlist, ETH_ZCIO_SERVER_ARG, &open_int, &server);
     if(ret < 0) {
@@ -663,12 +669,14 @@ rte_pmd_zcio_probe(struct rte_vdev_device *dev)
     }
     
     // 解析 queues 参数
-    ret = parse_kvargs(kvlist, ETH_ZCIO_QUEUES_ARG, &open_int, &queues);
-    if(ret < 0) {
-        ZCIO_LOG(ERR, "queues param error\n");
-		queues = 1; 
-    }
-
+	if(rte_kvargs_count(kvlist, ETH_ZCIO_QUEUES_ARG) == 1) {
+		ret = parse_kvargs(kvlist, ETH_ZCIO_QUEUES_ARG, &open_int, &queues);
+		if(ret < 0) {
+			ZCIO_LOG(ERR, "queues param error\n");
+			queues = 1; 
+    	}
+	}
+    
     // 解析 memctl-iface 参数
     if (!server) {
         ret = parse_kvargs(kvlist, ETH_ZCIO_MEMCTL_IFACE_ARG, &open_iface, &memctl_iface);

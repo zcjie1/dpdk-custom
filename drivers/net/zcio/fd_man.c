@@ -10,8 +10,10 @@
 
 #include "fd_man.h"
 
+RTE_LOG_REGISTER_DEFAULT(fdset_logtype, INFO);
 
-#define RTE_LOGTYPE_VHOST_FDMAN RTE_LOGTYPE_USER1
+#define FDMAN_LOG(level, fmt, args...) \
+	rte_log(RTE_LOG_ ## level, fdset_logtype, fmt, ##args)
 
 #define FDPOLLERR (POLLERR | POLLHUP | POLLNVAL)
 
@@ -340,8 +342,8 @@ fd_set_pipe_init(struct fd_set *fd_set)
 	int ret;
 
 	if (pipe(fd_set->u.pipefd) < 0) {
-		RTE_LOG(ERR, VHOST_FDMAN,
-			"failed to create pipe for vhost fd_set\n");
+		FDMAN_LOG(ERR,
+			"failed to create pipe for zcio fd_set\n");
 		return -1;
 	}
 
@@ -349,8 +351,8 @@ fd_set_pipe_init(struct fd_set *fd_set)
 			fd_set_pipe_read_cb, NULL, fd_set);
 
 	if (ret < 0) {
-		RTE_LOG(ERR, VHOST_FDMAN,
-			"failed to add pipe readfd %d into vhost server fd_set\n",
+		FDMAN_LOG(ERR,
+			"failed to add pipe readfd %d into zcio server fd_set\n",
 			fd_set->u.readfd);
 
 		fd_set_pipe_uninit(fd_set);
