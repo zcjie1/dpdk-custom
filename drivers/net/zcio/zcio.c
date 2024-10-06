@@ -17,6 +17,16 @@
 
 #include "zcio.h"
 
+RTE_LOG_REGISTER_DEFAULT(zcio_logtype, INFO);
+
+#define ZCIO_LOG(level, ...) \
+	rte_log(RTE_LOG_ ## level, zcio_logtype, __VA_ARGS__)
+
+#define ETH_ZCIO_SERVER_ARG		        "server"
+#define ETH_ZCIO_SERVER_IFACE_ARG       "server-iface"
+#define ETH_ZCIO_QUEUES_ARG		        "queues"
+#define ETH_ZCIO_MEMCTL_IFACE_ARG		"memctl-iface"
+
 static const char *valid_arguments[] = {
 	ETH_ZCIO_SERVER_ARG,
     ETH_ZCIO_SERVER_IFACE_ARG,
@@ -158,11 +168,11 @@ zcio_start_server(struct rte_eth_dev *dev)
 	if (fd < 0)
 		goto out;
 	
-	ret = fcntl(fd, F_SETFL, O_NONBLOCK);
-	if(ret < 0) {
-		ZCIO_LOG(ERR, "failed to set fd to non-blocking mode\n");
-		goto out_free_fd;
-	}
+	// ret = fcntl(fd, F_SETFL, O_NONBLOCK);
+	// if(ret < 0) {
+	// 	ZCIO_LOG(ERR, "failed to set fd to non-blocking mode\n");
+	// 	goto out_free_fd;
+	// }
 	
 	un = &sock->un;
 	memset(un, 0, sizeof(*un));
@@ -183,6 +193,8 @@ zcio_start_server(struct rte_eth_dev *dev)
 	ret = listen(fd, 4);
 	if (ret < 0)
 		goto out_free_fd;
+	
+	ZCIO_LOG(INFO, "listening on %s\n", internal->server_iface);
 	
 	struct zcio_socket *client_sock = &(internal->unix_sock[TYPE_SERVER_2_CLIENT]);
 	int client_fd;

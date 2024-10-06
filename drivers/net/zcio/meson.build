@@ -12,4 +12,4 @@ sources += files(
         'utils.c',
         'fd_man.c',
 )
-deps += ['kvargs', 'bus_vdev', 'ethdev', 'vhost']
+deps += ['kvargs', 'bus_vdev', 'ethdev']

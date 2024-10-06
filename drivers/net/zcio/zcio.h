@@ -6,16 +6,6 @@
 #include "utils.h"
 #include "fd_man.h"
 
-RTE_LOG_REGISTER_DEFAULT(zcio_logtype, INFO);
-
-#define ZCIO_LOG(level, ...) \
-	rte_log(RTE_LOG_ ## level, zcio_logtype, __VA_ARGS__)
-
-#define ETH_ZCIO_SERVER_ARG		        "server"
-#define ETH_ZCIO_SERVER_IFACE_ARG       "server-iface"
-#define ETH_ZCIO_QUEUES_ARG		        "queues"
-#define ETH_ZCIO_MEMCTL_IFACE_ARG		"memctl-iface"
-
 #define MAX_RECONNECT 8
 
 enum zcio_socket_type {
