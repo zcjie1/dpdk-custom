@@ -3,6 +3,7 @@
 
 #include <sys/un.h>
 #include <rte_memory.h>
+#include <rte_ring.h>
 #include "utils.h"
 #include "fd_man.h"
 
@@ -36,6 +37,31 @@ struct meminfo {
 	uint64_t invalid_mask; // 标注未成功获取或mmap的fd
 };
 
+struct zcio_queue {
+	struct zcio_socket *sock;
+	struct rte_ring *ring; // rte_ring_create'd
+	uint64_t packet_num;
+	uint64_t packet_bytes;
+};
+
+enum zcio_msg_type {
+	ZCIO_MSG_PACKET,
+	ZCIO_MSG_NUM
+};
+
+#define ZCIO_MAX_BURST 32
+struct pkt_info {
+	uint16_t pkt_num;
+	uint64_t host_start_addr[ZCIO_MAX_BURST];
+} __rte_packed;
+
+struct zcio_msg {
+	enum zcio_msg_type type;
+	union {
+		struct pkt_info packets;
+	}payload;
+} __rte_packed;
+
 struct pmd_internal {
     bool server;
 	rte_atomic16_t attched; // server 和 client 已连接
@@ -46,6 +72,8 @@ struct pmd_internal {
 	struct fd_set fd_set;
 	struct meminfo host_mem;
 	struct meminfo guest_mem;
+	struct zcio_queue rx_queue;
+	struct zcio_queue tx_queue;
 };
 
 #endif // !__ZCIO_H__
