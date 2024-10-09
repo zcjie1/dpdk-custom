@@ -105,7 +105,8 @@ eth_dev_close(struct rte_eth_dev *dev)
 			ret = fd_set_try_del(&internal->fd_set, 
 				internal->unix_sock[TYPE_SERVER_2_CLIENT].sock_fd);
 		}
-		close(internal->unix_sock[TYPE_SERVER_2_CLIENT].sock_fd);
+		if(internal->unix_sock[TYPE_SERVER_2_CLIENT].sock_fd != -1)
+			close(internal->unix_sock[TYPE_SERVER_2_CLIENT].sock_fd);
 	}else {
 		ret = fd_set_try_del(&internal->fd_set, 
 			internal->unix_sock[TYPE_CLIENT_2_SERVER].sock_fd);
@@ -114,7 +115,8 @@ eth_dev_close(struct rte_eth_dev *dev)
 			ret = fd_set_try_del(&internal->fd_set, 
 				internal->unix_sock[TYPE_CLIENT_2_SERVER].sock_fd);
 		}
-		close(internal->unix_sock[TYPE_CLIENT_2_SERVER].sock_fd);
+		if(internal->unix_sock[TYPE_CLIENT_2_SERVER].sock_fd != -1)
+			close(internal->unix_sock[TYPE_CLIENT_2_SERVER].sock_fd);
 
 		if(internal->guest_mem.region_nr != 0) {
 			for(int i = 0; i < internal->guest_mem.region_nr; i++) {
@@ -131,8 +133,9 @@ eth_dev_close(struct rte_eth_dev *dev)
 
 	ret = eth_dev_stop(dev);
 	
-	unlink(internal->server_iface);
-	unlink(internal->memctl_iface);
+	if(internal->server) {
+		unlink(internal->server_iface);
+	}
 	rte_ring_free(internal->rx_queue.ring);
 	rte_free(internal->server_iface);
 	rte_free(internal->memctl_iface);
@@ -144,7 +147,7 @@ eth_dev_close(struct rte_eth_dev *dev)
 }
 
 static void
-zcio_server_msg_handler(int client_fd, void *dat, int *remove __rte_unused) 
+zcio_server_msg_handler(int client_fd, void *dat, int *remove) 
 {
 	struct rte_eth_dev *dev = dat;
 	struct pmd_internal *internal = dev->data->dev_private;
@@ -168,6 +171,12 @@ zcio_server_msg_handler(int client_fd, void *dat, int *remove __rte_unused)
 	ret = recvmsg(client_fd, &msgh, 0);
 	if (ret < 0) {
 		ZCIO_LOG(ERR, "SERVER_2_CLIENT recvmsg failed\n");
+		return;
+	}else if(ret == 0) {
+		ZCIO_LOG(INFO, "client close the connection\n");
+		close(client_fd);
+		internal->unix_sock[TYPE_SERVER_2_CLIENT].sock_fd = -1;
+		*remove = 1;
 		return;
 	}
 	
@@ -223,6 +232,12 @@ zcio_client_msg_handler(int server_fd, void *dat, int *remove __rte_unused)
 	ret = recvmsg(server_fd, &msgh, 0);
 	if (ret < 0) {
 		ZCIO_LOG(ERR, "SERVER_2_CLIENT recvmsg failed\n");
+		return;
+	}else if(ret == 0) {
+		ZCIO_LOG(INFO, "server close the connection\n");
+		close(server_fd);
+		internal->unix_sock[TYPE_CLIENT_2_SERVER].sock_fd = -1;
+		*remove = 1;
 		return;
 	}
 	
@@ -808,13 +823,23 @@ eth_zcio_client_rx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 			ZCIO_LOG(ERR, "invalid packet address %lx", (uint64_t)bufs[i]);
 			continue;
 		}
+		// rte_mbuf转换
 		tmp_addr = tmp_addr - internal->host_mem.regions[idx].satrt_addr 
 			- internal->host_mem.regions[idx].mmap_offset;
 		tmp_addr = tmp_addr + internal->guest_mem.regions[idx].satrt_addr 
 			+ internal->guest_mem.regions[idx].mmap_offset;
-		bufs[recv_num++] = (struct rte_mbuf *)tmp_addr;
+		bufs[recv_num] = (struct rte_mbuf *)tmp_addr;
+		
+		// buf_addr转换
+		tmp_addr = (uint64_t)bufs[recv_num]->buf_addr;
+		tmp_addr = tmp_addr - internal->host_mem.regions[idx].satrt_addr 
+			- internal->host_mem.regions[idx].mmap_offset;
+		tmp_addr = tmp_addr + internal->guest_mem.regions[idx].satrt_addr 
+			+ internal->guest_mem.regions[idx].mmap_offset;
+		bufs[recv_num]->buf_addr = (void *)tmp_addr;
 		tmp_bytes += bufs[i]->pkt_len;
 		tmp_pkts++;
+		recv_num++;
 	}
 	free(host_addr);
 	vq->packet_bytes += tmp_bytes;
@@ -850,6 +875,14 @@ eth_zcio_client_tx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 					ZCIO_LOG(ERR, "invalid packet address %lx", (uint64_t)bufs[sent_bufs + i]);
 					goto out;
 				}
+				// buf_addr转换
+				host_addr = (uint64_t)bufs[sent_bufs + i]->buf_addr - internal->guest_mem.regions[idx].satrt_addr
+					- internal->guest_mem.regions[idx].mmap_offset;
+				host_addr = host_addr + internal->host_mem.regions[idx].satrt_addr 
+					+ internal->host_mem.regions[idx].mmap_offset;
+				bufs[sent_bufs + i]->buf_addr = (void *)host_addr;
+				
+				// rte_mbuf转换
 				host_addr = (uint64_t)bufs[sent_bufs + i] - internal->guest_mem.regions[idx].satrt_addr
 					- internal->guest_mem.regions[idx].mmap_offset;
 				host_addr = host_addr + internal->host_mem.regions[idx].satrt_addr 
