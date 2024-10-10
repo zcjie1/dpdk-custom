@@ -18,6 +18,7 @@ enum zcio_socket_type {
 };
 
 struct zcio_socket {
+	pthread_mutex_t mutex;
 	int sock_fd;
 	struct sockaddr_un un;
 };
@@ -45,6 +46,7 @@ struct zcio_queue {
 };
 
 enum zcio_msg_type {
+	ZCIO_MSG_MAGIC = 8,
 	ZCIO_MSG_PACKET,
 	ZCIO_MSG_NUM
 };
