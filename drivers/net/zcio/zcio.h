@@ -38,8 +38,10 @@ struct meminfo {
 	uint64_t invalid_mask; // 标注未成功获取或mmap的fd
 };
 
+#define MAX_NAME_LEN 64
 struct zcio_queue {
 	struct zcio_socket *sock;
+	char *name; // malloc'd
 	struct rte_ring *ring; // rte_ring_create'd
 	uint64_t packet_num;
 	uint64_t packet_bytes;

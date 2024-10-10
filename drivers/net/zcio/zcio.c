@@ -149,6 +149,7 @@ eth_dev_close(struct rte_eth_dev *dev)
 	if(internal->server) {
 		unlink(internal->server_iface);
 	}
+	free(internal->rx_queue.name);
 	rte_ring_free(internal->rx_queue.ring);
 	rte_free(dev->data->mac_addrs);
 	rte_free(internal->server_iface);
@@ -617,8 +618,11 @@ eth_rx_queue_setup(struct rte_eth_dev *dev, uint16_t rx_queue_id,
 {
 	struct pmd_internal *internal = dev->data->dev_private;
 	struct zcio_queue *vq = &internal->rx_queue;
+	static int rxq_num;
+	vq->name = (char *)malloc(MAX_NAME_LEN);
+	snprintf(vq->name, MAX_NAME_LEN, "zcio_rx_queue_%d", rxq_num++);
 
-	vq->ring = rte_ring_create("zcio_rx_queue", nb_rx_desc, socket_id,
+	vq->ring = rte_ring_create(vq->name, nb_rx_desc, socket_id,
 				  RING_F_SP_ENQ |RING_F_SC_DEQ);
 	if(internal->server)
 		vq->sock = &(internal->unix_sock[TYPE_SERVER_2_CLIENT]);
@@ -650,6 +654,7 @@ static void
 eth_rx_queue_release(struct rte_eth_dev *dev, uint16_t qid __rte_unused)
 {
 	struct pmd_internal *internal = dev->data->dev_private;
+	free(internal->rx_queue.name);
 	rte_ring_free(internal->rx_queue.ring);
 	return;
 }
