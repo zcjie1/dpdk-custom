@@ -52,6 +52,8 @@ static struct rte_eth_link pmd_link = {
     .link_status = RTE_ETH_LINK_DOWN
 };
 
+struct fd_set zcio_fdset;
+
 static int
 eth_dev_start(struct rte_eth_dev *eth_dev)
 {
@@ -103,10 +105,10 @@ eth_dev_close(struct rte_eth_dev *dev)
 	if(internal->server) {
 		fd = internal->unix_sock[TYPE_SERVER_2_CLIENT].sock_fd;
 		if(fd != -1) {
-			ret = fd_set_try_del(&internal->fd_set, fd);
+			ret = fd_set_try_del(&zcio_fdset, fd);
 			while(ret == -1) {
 				usleep(100);
-				ret = fd_set_try_del(&internal->fd_set, fd);
+				ret = fd_set_try_del(&zcio_fdset, fd);
 			}
 			internal->unix_sock[TYPE_SERVER_2_CLIENT].sock_fd = -1;
 			close(fd);
@@ -114,10 +116,10 @@ eth_dev_close(struct rte_eth_dev *dev)
 	}else {
 		fd = internal->unix_sock[TYPE_CLIENT_2_SERVER].sock_fd;
 		if(fd != -1) {
-			ret = fd_set_try_del(&internal->fd_set, fd);
+			ret = fd_set_try_del(&zcio_fdset, fd);
 			while(ret == -1) {
 				usleep(100);
-				ret = fd_set_try_del(&internal->fd_set, fd);
+				ret = fd_set_try_del(&zcio_fdset, fd);
 			}
 			internal->unix_sock[TYPE_CLIENT_2_SERVER].sock_fd = -1;
 			close(fd);
@@ -286,6 +288,42 @@ zcio_client_msg_handler(int server_fd, void *dat, int *remove)
 	return;
 }
 
+static void
+zcio_server_new_connection(int listen_fd, void *dat, int *remove)
+{
+	struct rte_eth_dev *dev = dat;
+	struct pmd_internal *internal = dev->data->dev_private;
+	struct zcio_socket *client_sock = &(internal->unix_sock[TYPE_SERVER_2_CLIENT]);
+	int client_fd;
+	int ret;
+	client_fd = accept(listen_fd, NULL, NULL);
+	if (client_fd < 0) {
+		ZCIO_LOG(ERR, "failed to accept client connection: %s\n",
+			strerror(errno));
+		return;
+	}
+	
+	ZCIO_LOG(INFO, "[%s] new zcio connection is %d\n",internal->server_iface, listen_fd);
+	ret = fd_set_add(&zcio_fdset, client_fd, zcio_server_msg_handler,
+			NULL, dev);
+	if (ret < 0) {
+		ZCIO_LOG(ERR, "[%s] failed to add fd %d into zcio server fd_set\n", 
+					internal->server_iface, client_fd);
+		close(client_fd);
+		return;
+	}
+
+	client_sock->sock_fd = client_fd;
+	rte_atomic16_set(&internal->attched, 1);
+	fd_set_pipe_notify(&zcio_fdset);
+	
+	internal->unix_sock[TYPE_SERVER_LISTENER].sock_fd = -1;
+	close(listen_fd);
+	*remove = 1;
+	ZCIO_LOG(INFO, "ZCIO server accept client succeeded\n");
+	return;
+}
+
 static int
 zcio_start_server(struct rte_eth_dev *dev)
 {
@@ -321,34 +359,14 @@ zcio_start_server(struct rte_eth_dev *dev)
 	if (ret < 0)
 		goto out_free_fd;
 	
-	ZCIO_LOG(INFO, "listening on %s\n", internal->server_iface);
-	
-	struct zcio_socket *client_sock = &(internal->unix_sock[TYPE_SERVER_2_CLIENT]);
-	int client_fd;
-	client_fd = accept(fd, NULL, NULL);
-	if (client_fd < 0) {
-		ZCIO_LOG(ERR, "failed to accept client connection: %s\n",
-			strerror(errno));
-		goto out_free_fd;
-	}
-		
-	ZCIO_LOG(INFO, "[%s] new zcio connection fd is %d\n",internal->server_iface, client_fd);
-	ret = fd_set_add(&internal->fd_set, client_fd, zcio_server_msg_handler,
-			NULL, dev);
+	ret = fd_set_add(&zcio_fdset, fd, zcio_server_new_connection, NULL, dev);
 	if (ret < 0) {
-		ZCIO_LOG(ERR, "[%s] failed to add fd %d into zcio server fd_set\n", 
-					internal->server_iface, client_fd);
-		close(client_fd);
+		ZCIO_LOG(ERR, "failed to add listen fd %d into zcio server fdset\n",
+			fd);
 		goto out_free_fd;
 	}
 	
-	client_sock->sock_fd = client_fd;
-	rte_atomic16_set(&internal->attched, 1);
-	fd_set_pipe_notify(&internal->fd_set);
-	
-	internal->unix_sock[TYPE_SERVER_LISTENER].sock_fd = -1;
-	close(fd);
-	ZCIO_LOG(INFO, "ZCIO server accept client succeeded\n");
+	ZCIO_LOG(INFO, "listening on %s\n", internal->server_iface);
 	return 0;
 
  out_free_fd:
@@ -408,7 +426,7 @@ static int client_connect_server(struct rte_eth_dev *dev)
 		return ret;
 	
 	sock->sock_fd = server_fd;
-	ret = fd_set_add(&internal->fd_set, server_fd, zcio_client_msg_handler,
+	ret = fd_set_add(&zcio_fdset, server_fd, zcio_client_msg_handler,
 		  NULL, dev);
 	if (ret < 0) {
 		ZCIO_LOG(ERR, "client2server_fd %d faild to be added into fd_set\n",
@@ -527,8 +545,7 @@ zcio_start_client(struct rte_eth_dev *dev)
 		for(int i = 0; i < fd_num; i++) {
 			fds[i] = -1;
 			close(fds[i]);
-		}
-			
+		}	
 		goto out;
 	}
 	
@@ -550,16 +567,16 @@ eth_dev_configure(struct rte_eth_dev *dev)
 	// 创建轮询线程，处理文件描述符集合的读写回调函数
 	static rte_thread_t fd_set_tid;
 	if (fd_set_tid.opaque_id == 0) {
-		if (fd_set_pipe_init(&internal->fd_set) < 0) {
+		if (fd_set_pipe_init(&zcio_fdset) < 0) {
 			ZCIO_LOG(ERR, "failed to create pipe for zcio fd_set\n");
 			return -1;
 		}
-
+		
 		int ret = rte_thread_create_internal_control(&fd_set_tid,
-				"zcio-evt", fd_set_event_dispatch, &internal->fd_set);
+				"zcio-evt", fd_set_event_dispatch, &zcio_fdset);
 		if (ret != 0) {
 			ZCIO_LOG(ERR, "failed to create fd_set handling thread\n");
-			fd_set_pipe_uninit(&internal->fd_set);
+			fd_set_pipe_uninit(&zcio_fdset);
 			return -1;
 		}
 	}
