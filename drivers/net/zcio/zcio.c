@@ -54,6 +54,8 @@ static struct rte_eth_link pmd_link = {
 
 struct fd_set zcio_fdset;
 
+static int zcio_send_msg(struct zcio_socket *sock, struct zcio_msg *msg);
+
 static int
 eth_dev_start(struct rte_eth_dev *eth_dev)
 {
@@ -139,7 +141,7 @@ eth_dev_close(struct rte_eth_dev *dev)
 	}
 
 	// 清空 rx_ring 中的元素
-	struct rte_ring *ring = internal->rx_queue.ring;
+	struct rte_ring *ring = internal->rx_queue.data_pkt_ring;
 	while(rte_ring_dequeue(ring, (void **)&elem) == 0) {
 		free(elem);
 	}
@@ -149,8 +151,10 @@ eth_dev_close(struct rte_eth_dev *dev)
 	if(internal->server) {
 		unlink(internal->server_iface);
 	}
-	free(internal->rx_queue.name);
-	rte_ring_free(internal->rx_queue.ring);
+	free(internal->rx_queue.data_ring_name);
+	free(internal->rx_queue.free_ring_name);
+	rte_ring_free(internal->rx_queue.data_pkt_ring);
+	rte_ring_free(internal->rx_queue.free_pkt_ring);
 	rte_free(dev->data->mac_addrs);
 	rte_free(internal->server_iface);
 	rte_free(internal->memctl_iface);
@@ -167,7 +171,7 @@ zcio_server_msg_handler(int client_fd, void *dat, int *remove)
 	struct rte_eth_dev *dev = dat;
 	struct pmd_internal *internal = dev->data->dev_private;
 	struct zcio_queue *rx_queue = &internal->rx_queue;
-	struct rte_ring *rx_ring = rx_queue->ring;
+	struct rte_ring *rx_ring = rx_queue->data_pkt_ring;
 	struct msghdr msgh;
     struct iovec iov;
 	struct zcio_msg msg;
@@ -197,16 +201,15 @@ zcio_server_msg_handler(int client_fd, void *dat, int *remove)
 		*remove = 1;
 		return;
 	}
-	
-	uint16_t pkt_num = msg.payload.packets.pkt_num;
-	uint64_t **host_addr = malloc(pkt_num * sizeof(uint64_t *));
-	for(int i = 0; i < pkt_num; i++) {
-		host_addr[i] = malloc(sizeof(uint64_t));
-		*(host_addr[i]) = msg.payload.packets.host_start_addr[i];
-	}
 		
 	switch(msg.type) {
-		case ZCIO_MSG_PACKET: {
+		case ZCIO_MSG_DATA_PKT: {
+			uint16_t pkt_num = msg.payload.packets.pkt_num;
+			uint64_t **host_addr = malloc(pkt_num * sizeof(uint64_t *));
+			for(int i = 0; i < pkt_num; i++) {
+				host_addr[i] = malloc(sizeof(uint64_t));
+				*(host_addr[i]) = msg.payload.packets.host_start_addr[i];
+			}
 			if(!rte_ring_enqueue_bulk(rx_ring, (void **)host_addr, pkt_num, NULL)) {
 				ZCIO_LOG(ERR, "server rx_ring is full\n");
 				for(int i = 0; i < pkt_num; i++)
@@ -214,11 +217,39 @@ zcio_server_msg_handler(int client_fd, void *dat, int *remove)
 			}
 			free(host_addr);
 		} break;
+		case ZCIO_MSG_REQUEST_PKT: {
+			// TODO 分配失败错误处理
+			struct zcio_msg response_msg = {
+				.type = ZCIO_MSG_RESPONSE_PKT,
+			};
+			struct rte_mbuf *alloc_pkts[MAX_FREE_QUEUE_SIZE];
+			uint16_t pkt_num = msg.payload.pkt_num;
+			ret = rte_pktmbuf_alloc_bulk(internal->mem_pool, alloc_pkts, pkt_num);
+			while(ret < 0) {
+				ZCIO_LOG(ERR, "Fail to alloc free packet for client\n");
+				ret = rte_pktmbuf_alloc_bulk(internal->mem_pool, alloc_pkts, pkt_num);
+			}
+			response_msg.payload.packets.pkt_num = pkt_num;
+			for(int i = 0; i < pkt_num; i++) {
+				response_msg.payload.packets.host_start_addr[i] = (uint64_t)alloc_pkts[i];
+			}
+			zcio_send_msg(internal->tx_queue.sock, &response_msg);
+		} break;
+		case ZCIO_MSG_FREE_PKT: {
+			uint16_t pkt_num = msg.payload.packets.pkt_num;
+			uint64_t **host_addr = malloc(pkt_num * sizeof(uint64_t *));
+			for(int i = 0; i < pkt_num; i++) {
+				host_addr[i] = malloc(sizeof(uint64_t));
+				*(host_addr[i]) = msg.payload.packets.host_start_addr[i];
+			}
+			for(int i = 0; i < pkt_num; i++) {
+				rte_pktmbuf_free((struct rte_mbuf *)*host_addr[i]);
+				free(host_addr[i]);
+			}
+			free(host_addr);
+		} break;
 		default:
 			ZCIO_LOG(ERR, "unknown msg type\n");
-			for(int i = 0; i < pkt_num; i++)
-				free(host_addr[i]);
-			free(host_addr);
 			break;
 	}
 	
@@ -231,7 +262,8 @@ zcio_client_msg_handler(int server_fd, void *dat, int *remove)
 	struct rte_eth_dev *dev = dat;
 	struct pmd_internal *internal = dev->data->dev_private;
 	struct zcio_queue *rx_queue = &internal->rx_queue;
-	struct rte_ring *rx_ring = rx_queue->ring;
+	struct rte_ring *rx_ring = rx_queue->data_pkt_ring;
+	struct rte_ring *free_ring = rx_queue->free_pkt_ring;
 	struct msghdr msgh;
     struct iovec iov;
 	struct zcio_msg msg;
@@ -262,15 +294,14 @@ zcio_client_msg_handler(int server_fd, void *dat, int *remove)
 		return;
 	}
 	
-	uint16_t pkt_num = msg.payload.packets.pkt_num;
-	uint64_t **host_addr = malloc(pkt_num * sizeof(uint64_t *));
-	for(int i = 0; i < pkt_num; i++) {
-		host_addr[i] = malloc(sizeof(uint64_t));
-		*(host_addr[i]) = msg.payload.packets.host_start_addr[i];
-	}
-		
 	switch(msg.type) {
-		case ZCIO_MSG_PACKET: {
+		case ZCIO_MSG_DATA_PKT: {
+			uint16_t pkt_num = msg.payload.packets.pkt_num;
+			uint64_t **host_addr = malloc(pkt_num * sizeof(uint64_t *));
+			for(int i = 0; i < pkt_num; i++) {
+				host_addr[i] = malloc(sizeof(uint64_t));
+				*(host_addr[i]) = msg.payload.packets.host_start_addr[i];
+			}
 			if(!rte_ring_enqueue_bulk(rx_ring, (void **)host_addr, pkt_num, NULL)) {
 				ZCIO_LOG(ERR, "client rx_ring is full\n");
 				for(int i = 0; i < pkt_num; i++)
@@ -278,11 +309,18 @@ zcio_client_msg_handler(int server_fd, void *dat, int *remove)
 			}
 			free(host_addr);
 		} break;
+		case ZCIO_MSG_RESPONSE_PKT: {
+			uint16_t pkt_num = msg.payload.pkt_num;
+			uint64_t **host_addr = malloc(pkt_num * sizeof(uint64_t *));
+			for(int i = 0; i < pkt_num; i++) {
+				host_addr[i] = malloc(sizeof(uint64_t));
+				*(host_addr[i]) = msg.payload.packets.host_start_addr[i];
+			}
+			rte_ring_enqueue_bulk(free_ring, (void **)host_addr, pkt_num, NULL);
+			free(host_addr);
+		} break;
 		default:
 			ZCIO_LOG(ERR, "unknown msg type\n");
-			for(int i = 0; i < pkt_num; i++)
-				free(host_addr[i]);
-			free(host_addr);
 			break;
 	}
 	
@@ -614,20 +652,29 @@ static int
 eth_rx_queue_setup(struct rte_eth_dev *dev, uint16_t rx_queue_id,
 		   uint16_t nb_rx_desc, unsigned int socket_id,
 		   const struct rte_eth_rxconf *rx_conf __rte_unused,
-		   struct rte_mempool *mb_pool __rte_unused)
+		   struct rte_mempool *mb_pool)
 {
 	struct pmd_internal *internal = dev->data->dev_private;
 	struct zcio_queue *vq = &internal->rx_queue;
 	static int rxq_num;
-	vq->name = (char *)malloc(MAX_NAME_LEN);
-	snprintf(vq->name, MAX_NAME_LEN, "zcio_rx_queue_%d", rxq_num++);
+	static int freeq_num;
+	vq->data_ring_name = (char *)malloc(MAX_NAME_LEN);
+	snprintf(vq->data_ring_name, MAX_NAME_LEN, "zcio_rx_queue_%d", rxq_num++);
 
-	vq->ring = rte_ring_create(vq->name, nb_rx_desc, socket_id,
+	vq->data_pkt_ring = rte_ring_create(vq->data_ring_name, nb_rx_desc, socket_id,
 				  RING_F_SP_ENQ |RING_F_SC_DEQ);
-	if(internal->server)
+	if(internal->server) {
 		vq->sock = &(internal->unix_sock[TYPE_SERVER_2_CLIENT]);
-	else
+		internal->mem_pool = mb_pool;
+	}
+	else {
 		vq->sock = &(internal->unix_sock[TYPE_CLIENT_2_SERVER]);
+		vq->free_ring_name = (char *)malloc(MAX_NAME_LEN);
+		snprintf(vq->free_ring_name, MAX_NAME_LEN, "zcio_free_queue_%d", freeq_num++);
+		vq->free_pkt_ring = rte_ring_create(vq->free_ring_name, MAX_FREE_QUEUE_SIZE, socket_id,
+				  RING_F_SP_ENQ |RING_F_SC_DEQ);
+	}
+		
 	dev->data->rx_queues[rx_queue_id] = vq;
 
 	return 0;
@@ -654,8 +701,10 @@ static void
 eth_rx_queue_release(struct rte_eth_dev *dev, uint16_t qid __rte_unused)
 {
 	struct pmd_internal *internal = dev->data->dev_private;
-	free(internal->rx_queue.name);
-	rte_ring_free(internal->rx_queue.ring);
+	free(internal->rx_queue.data_ring_name);
+	free(internal->rx_queue.free_ring_name);
+	rte_ring_free(internal->rx_queue.data_pkt_ring);
+	rte_ring_free(internal->rx_queue.free_pkt_ring);
 	return;
 }
 
@@ -773,7 +822,7 @@ eth_zcio_server_rx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 {
 	struct zcio_queue *rx_queue = q;
 	struct pmd_internal *internal = container_of(rx_queue, struct pmd_internal, rx_queue);
-	struct rte_ring *ring = rx_queue->ring;
+	struct rte_ring *ring = rx_queue->data_pkt_ring;
 	int ret = 0;
 	
 	if(rte_atomic16_read(&internal->attched) == 0)
@@ -801,7 +850,7 @@ eth_zcio_server_tx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 	if(rte_atomic16_read(&internal->attched) == 0)
 		return 0;
 	struct zcio_msg msg = {
-		.type = ZCIO_MSG_PACKET,
+		.type = ZCIO_MSG_DATA_PKT,
 	};
 	
 	uint16_t avail_bufs = nb_bufs;
@@ -863,24 +912,89 @@ addr_translation(uint64_t addr, struct memory_region *src,
 	return ret;
 }
 
+/**
+ * nb_bufs最大值设置为32767， 最高位设置为flag
+ * flag = 0 时， nb_bufs为待收取的携带实际数据的包个数
+ * flag = 1 时， nb_bufs为待收取的空闲数据包的包个数
+ */
 static uint16_t
 eth_zcio_client_rx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 {
 	struct zcio_queue *vq = q;
 	struct pmd_internal *internal = container_of(vq, struct pmd_internal, rx_queue);
-	struct rte_ring *ring = vq->ring;
+	struct rte_ring *data_ring = vq->data_pkt_ring;
+	struct rte_ring *free_ring = vq->free_pkt_ring;
 	uint64_t tmp_addr;
 	uint64_t tmp_bytes = 0;
 	uint64_t tmp_pkts = 0;
-	int i = 0, ret = 0;
-	int idx = -1;
+	int i = 0, ret = 0, idx = -1;
 	int recv_num = 0;
+	uint64_t **host_addr = NULL;
+
+	if(bufs == NULL) {
+		ZCIO_LOG(ERR, "RX bufs is NULL");
+		return 0;
+	}
 	
 	if(rte_atomic16_read(&internal->attched) == 0)
 		return 0;
 	
-	uint64_t **host_addr = malloc(nb_bufs * sizeof(uint64_t *));
-	ret = rte_ring_dequeue_burst(ring, (void **)host_addr, nb_bufs, NULL);
+	if(nb_bufs > MAX_RX_BURST_NUM) {
+		struct zcio_msg msg = {
+			.type = ZCIO_MSG_REQUEST_PKT,
+		};
+		unsigned int request_num = 0;
+		unsigned int free_avail_num = 0;
+		unsigned int free_num = nb_bufs - MAX_RX_BURST_NUM;
+		if(free_num > MAX_FREE_QUEUE_SIZE) {
+			ZCIO_LOG(ERR, "Error: request too many free pkt\n");
+			return 0;
+		}
+		host_addr = malloc(free_num * sizeof(uint64_t *));
+		ret = rte_ring_dequeue_bulk(free_ring, (void **)host_addr, free_num, &free_avail_num);
+		if(ret == 0) {
+			request_num = (free_num - free_avail_num) < 8 ? 8 : (free_num - free_avail_num);
+			request_num = request_num > (MAX_FREE_QUEUE_SIZE - free_avail_num) ? 
+						(MAX_FREE_QUEUE_SIZE - free_avail_num) : 
+						request_num;
+			msg.payload.pkt_num = request_num;
+			zcio_send_msg(vq->sock, &msg);
+			while(ret == 0) {
+				ret = rte_ring_dequeue_bulk(free_ring, (void **)host_addr, free_num, &free_avail_num);
+			}
+		}
+		for(i = 0; i < ret; i++) {
+			tmp_addr = *(host_addr[i]);
+			free(host_addr[i]);
+			idx = addr2idx((void *)tmp_addr, &internal->host_mem);
+			if(idx == -1) {
+				ZCIO_LOG(ERR, "invalid packet address %lx", (uint64_t)bufs[i]);
+				continue;
+			}
+			// rte_mbuf转换
+			tmp_addr = addr_translation(tmp_addr, &internal->host_mem.regions[idx], 
+				&internal->guest_mem.regions[idx]);
+			bufs[recv_num] = (struct rte_mbuf *)tmp_addr;
+			
+			// buf_addr转换
+			tmp_addr = (uint64_t)bufs[recv_num]->buf_addr;
+			tmp_addr = addr_translation(tmp_addr, &internal->host_mem.regions[idx], 
+				&internal->guest_mem.regions[idx]);
+			bufs[recv_num]->buf_addr = (void *)tmp_addr;
+			bufs[recv_num]->dynfield1[0] = 0;
+			
+			tmp_bytes += bufs[i]->pkt_len;
+			tmp_pkts++;
+			recv_num++;
+		}
+		free(host_addr);
+		vq->packet_bytes += tmp_bytes;
+		vq->packet_num += tmp_pkts;
+		return recv_num + MAX_RX_BURST_NUM;
+	}
+	
+	host_addr = malloc(nb_bufs * sizeof(uint64_t *));
+	ret = rte_ring_dequeue_burst(data_ring, (void **)host_addr, nb_bufs, NULL);
 	for(i = 0; i < ret; i++) {
 		tmp_addr = *(host_addr[i]);
 		free(host_addr[i]);
@@ -899,6 +1013,7 @@ eth_zcio_client_rx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 		tmp_addr = addr_translation(tmp_addr, &internal->host_mem.regions[idx], 
 			&internal->guest_mem.regions[idx]);
 		bufs[recv_num]->buf_addr = (void *)tmp_addr;
+		bufs[recv_num]->dynfield1[0] = 0;
 	
 		tmp_bytes += bufs[i]->pkt_len;
 		tmp_pkts++;
@@ -910,24 +1025,34 @@ eth_zcio_client_rx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 	return recv_num;
 }
 
+/**
+ * 当发送数据包的dynfield1[0]为114514，则表示该数据包为待释放包
+ */
 static uint16_t
 eth_zcio_client_tx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 {
 	struct zcio_queue *vq = q;
 	struct pmd_internal *internal = container_of(vq, struct pmd_internal, tx_queue);
-	if(rte_atomic16_read(&internal->attched) == 0)
-		return 0;
 	struct zcio_msg msg = {
-		.type = ZCIO_MSG_PACKET,
+		.type = ZCIO_MSG_DATA_PKT,
 	};
-	
 	int idx = 0;
 	uint64_t host_addr = 0;
-	
 	uint16_t avail_bufs = nb_bufs;
 	uint16_t sent_bufs = 0;
 	uint64_t total_bytes = 0;
 	uint64_t epoch_bytes = 0;
+	
+	if(rte_atomic16_read(&internal->attched) == 0)
+		return 0;
+		
+	if(bufs == NULL)
+		return 0;
+	
+	if(bufs[0]->dynfield1[0] == 114514) {
+		msg.type = ZCIO_MSG_FREE_PKT;
+	}
+	
 	while(avail_bufs > 0) {
 		epoch_bytes = 0;
 		if(avail_bufs <= ZCIO_MAX_BURST) {

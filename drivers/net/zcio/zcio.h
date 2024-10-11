@@ -8,6 +8,7 @@
 #include "fd_man.h"
 
 #define MAX_RECONNECT 8
+#define MAX_RX_BURST_NUM 32767
 
 enum zcio_socket_type {
 	TYPE_CLIENT_2_SERVER,
@@ -39,17 +40,23 @@ struct meminfo {
 };
 
 #define MAX_NAME_LEN 64
+#define MAX_FREE_QUEUE_SIZE	32
 struct zcio_queue {
 	struct zcio_socket *sock;
-	char *name; // malloc'd
-	struct rte_ring *ring; // rte_ring_create'd
+	char *data_ring_name; // malloc'd
+	char *free_ring_name; // malloc'd
+	struct rte_ring *data_pkt_ring; // rte_ring_create'd
+	struct rte_ring *free_pkt_ring; // rte_ring_create'd
 	uint64_t packet_num;
 	uint64_t packet_bytes;
 };
 
 enum zcio_msg_type {
-	ZCIO_MSG_MAGIC = 8,
-	ZCIO_MSG_PACKET,
+	ZCIO_MSG_MAGIC = 4,
+	ZCIO_MSG_DATA_PKT,
+	ZCIO_MSG_REQUEST_PKT, // client -> server 请求分配数据包空间
+	ZCIO_MSG_RESPONSE_PKT, // server -> client 响应分配数据包空间
+	ZCIO_MSG_FREE_PKT, // client -> server 释放数据包空间
 	ZCIO_MSG_NUM
 };
 
@@ -62,6 +69,7 @@ struct pkt_info {
 struct zcio_msg {
 	enum zcio_msg_type type;
 	union {
+		uint16_t pkt_num;
 		struct pkt_info packets;
 	}payload;
 } __rte_packed;
@@ -76,6 +84,7 @@ struct pmd_internal {
 	struct meminfo host_mem;
 	struct meminfo guest_mem;
 	struct zcio_queue rx_queue;
+	struct rte_mempool *mem_pool;
 	struct zcio_queue tx_queue;
 };
 
