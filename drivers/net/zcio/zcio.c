@@ -990,7 +990,7 @@ eth_zcio_client_rx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 		free(host_addr);
 		vq->packet_bytes += tmp_bytes;
 		vq->packet_num += tmp_pkts;
-		return recv_num + MAX_RX_BURST_NUM;
+		return recv_num;
 	}
 	
 	host_addr = malloc(nb_bufs * sizeof(uint64_t *));
