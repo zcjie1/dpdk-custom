@@ -14,6 +14,7 @@
 #include <ethdev_driver.h>
 #include <ethdev_vdev.h>
 #include <bus_vdev_driver.h>
+#include <rte_net.h>
 
 #include "zcio.h"
 
@@ -232,6 +233,7 @@ zcio_server_msg_handler(int client_fd, void *dat, int *remove)
 			response_msg.payload.packets.pkt_num = pkt_num;
 			for(int i = 0; i < pkt_num; i++) {
 				response_msg.payload.packets.host_start_addr[i] = (uint64_t)alloc_pkts[i];
+				alloc_pkts[i]->nb_segs = 1;
 			}
 			zcio_send_msg(internal->tx_queue.sock, &response_msg);
 		} break;
@@ -598,10 +600,36 @@ zcio_start_client(struct rte_eth_dev *dev)
 	return -1;
 }
 
+static void
+zcio_dev_csum_configure(struct rte_eth_dev *eth_dev)
+{
+	struct pmd_internal *internal = eth_dev->data->dev_private;
+	const struct rte_eth_rxmode *rxmode = &eth_dev->data->dev_conf.rxmode;
+	const struct rte_eth_txmode *txmode = &eth_dev->data->dev_conf.txmode;
+
+	internal->rx_csum = false;
+	internal->tx_csum = false;
+
+	if ((rxmode->offloads &
+			(RTE_ETH_RX_OFFLOAD_UDP_CKSUM | RTE_ETH_RX_OFFLOAD_TCP_CKSUM))) {
+		ZCIO_LOG(INFO, "Rx csum will be done in SW, may impact performance.\n");
+		internal->rx_csum = true;
+	}
+	
+	if (txmode->offloads &
+			(RTE_ETH_TX_OFFLOAD_UDP_CKSUM | RTE_ETH_TX_OFFLOAD_TCP_CKSUM)) {
+		ZCIO_LOG(INFO, "Tx csum will be done in SW, may impact performance.\n");
+		internal->tx_csum = true;
+	}
+	
+}
+
 static int
 eth_dev_configure(struct rte_eth_dev *dev)
 {
 	struct pmd_internal *internal = dev->data->dev_private;
+
+	zcio_dev_csum_configure(dev);
 	
 	// 创建轮询线程，处理文件描述符集合的读写回调函数
 	static rte_thread_t fd_set_tid;
@@ -644,6 +672,14 @@ eth_dev_info(struct rte_eth_dev *dev,
 	dev_info->max_rx_queues = dev->data->nb_rx_queues;
 	dev_info->max_tx_queues = dev->data->nb_tx_queues;
 	dev_info->min_rx_bufsize = 0;
+
+	dev_info->tx_offload_capa = RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
+	
+	dev_info->tx_offload_capa |= RTE_ETH_TX_OFFLOAD_UDP_CKSUM |
+		RTE_ETH_TX_OFFLOAD_TCP_CKSUM;
+	
+	dev_info->rx_offload_capa |= RTE_ETH_RX_OFFLOAD_UDP_CKSUM |
+		RTE_ETH_RX_OFFLOAD_TCP_CKSUM;
 
 	return 0;
 }
@@ -817,6 +853,90 @@ zcio_send_msg(struct zcio_socket *sock, struct zcio_msg *msg)
 	return r;
 }
 
+static void
+zcio_dev_tx_sw_csum(struct rte_mbuf *mbuf)
+{
+	uint32_t hdr_len;
+	uint16_t csum = 0, csum_offset;
+
+	switch (mbuf->ol_flags & RTE_MBUF_F_TX_L4_MASK) {
+	case RTE_MBUF_F_TX_L4_NO_CKSUM:
+		return;
+	case RTE_MBUF_F_TX_TCP_CKSUM:
+		csum_offset = offsetof(struct rte_tcp_hdr, cksum);
+		break;
+	case RTE_MBUF_F_TX_UDP_CKSUM:
+		csum_offset = offsetof(struct rte_udp_hdr, dgram_cksum);
+		break;
+	default:
+		/* Unsupported packet type. */
+		return;
+	}
+
+	hdr_len = mbuf->l2_len + mbuf->l3_len;
+	csum_offset += hdr_len;
+
+	/* Prepare the pseudo-header checksum */
+	if (rte_net_intel_cksum_prepare(mbuf) < 0)
+		return;
+
+	if (rte_raw_cksum_mbuf(mbuf, hdr_len, rte_pktmbuf_pkt_len(mbuf) - hdr_len, &csum) < 0)
+		return;
+
+	csum = ~csum;
+	/* See RFC768 */
+	if (unlikely((mbuf->packet_type & RTE_PTYPE_L4_UDP) && csum == 0))
+		csum = 0xffff;
+
+	if (rte_pktmbuf_data_len(mbuf) >= csum_offset + 1)
+		*rte_pktmbuf_mtod_offset(mbuf, uint16_t *, csum_offset) = csum;
+
+	mbuf->ol_flags &= ~RTE_MBUF_F_TX_L4_MASK;
+	mbuf->ol_flags |= RTE_MBUF_F_TX_L4_NO_CKSUM;
+}
+
+static void
+zcio_dev_rx_sw_csum(struct rte_mbuf *mbuf)
+{
+	struct rte_net_hdr_lens hdr_lens;
+	uint32_t ptype, hdr_len;
+	uint16_t csum = 0, csum_offset;
+
+	/* Return early if the L4 checksum was not offloaded */
+	if ((mbuf->ol_flags & RTE_MBUF_F_RX_L4_CKSUM_MASK) != RTE_MBUF_F_RX_L4_CKSUM_NONE)
+		return;
+
+	ptype = rte_net_get_ptype(mbuf, &hdr_lens, RTE_PTYPE_ALL_MASK);
+
+	hdr_len = hdr_lens.l2_len + hdr_lens.l3_len;
+
+	switch (ptype & RTE_PTYPE_L4_MASK) {
+	case RTE_PTYPE_L4_TCP:
+		csum_offset = offsetof(struct rte_tcp_hdr, cksum) + hdr_len;
+		break;
+	case RTE_PTYPE_L4_UDP:
+		csum_offset = offsetof(struct rte_udp_hdr, dgram_cksum) + hdr_len;
+		break;
+	default:
+		/* Unsupported packet type */
+		return;
+	}
+
+	if (rte_raw_cksum_mbuf(mbuf, hdr_len, rte_pktmbuf_pkt_len(mbuf) - hdr_len, &csum) < 0)
+		return;
+
+	csum = ~csum;
+	/* See RFC768 */
+	if (unlikely((ptype & RTE_PTYPE_L4_UDP) && csum == 0))
+		csum = 0xffff;
+
+	if (rte_pktmbuf_data_len(mbuf) >= csum_offset + 1)
+		*rte_pktmbuf_mtod_offset(mbuf, uint16_t *, csum_offset) = csum;
+
+	mbuf->ol_flags &= ~RTE_MBUF_F_RX_L4_CKSUM_MASK;
+	mbuf->ol_flags |= RTE_MBUF_F_RX_L4_CKSUM_GOOD;
+}
+
 static uint16_t
 eth_zcio_server_rx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 {
@@ -833,6 +953,8 @@ eth_zcio_server_rx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 	ret = rte_ring_dequeue_burst(ring, (void **)host_addr, nb_bufs, NULL);
 	for(int i = 0; i < ret; i++) {
 		bufs[i] = (struct rte_mbuf *)(*(host_addr[i]));
+		// if(internal->rx_csum)
+		// 	zcio_dev_rx_sw_csum(bufs[i]);
 		free(host_addr[i]);
 		rx_queue->packet_bytes += bufs[i]->pkt_len;
 		rx_queue->packet_num++;
@@ -862,6 +984,8 @@ eth_zcio_server_tx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 			for(int i = 0; i < avail_bufs; i++) {
 				msg.payload.packets.host_start_addr[i] = (uint64_t)bufs[sent_bufs + i];
 				total_bytes += bufs[sent_bufs + i]->pkt_len;
+				// if(internal->tx_csum)
+				// 	zcio_dev_tx_sw_csum(bufs[sent_bufs + i]);
 			}
 			zcio_send_msg(vq->sock, &msg);
 			sent_bufs += avail_bufs;
@@ -873,6 +997,8 @@ eth_zcio_server_tx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 		for(int i = 0; i < ZCIO_MAX_BURST; i++) {
 			msg.payload.packets.host_start_addr[i] = (uint64_t)bufs[sent_bufs + i];
 			total_bytes += bufs[sent_bufs + i]->pkt_len;
+			// if(internal->tx_csum)
+			// 	zcio_dev_tx_sw_csum(bufs[sent_bufs + i]);
 		}
 		zcio_send_msg(vq->sock, &msg);
 		sent_bufs += ZCIO_MAX_BURST;
@@ -912,6 +1038,58 @@ addr_translation(uint64_t addr, struct memory_region *src,
 	return ret;
 }
 
+static struct rte_mbuf *
+mbuf_addr_translation_client_rx(uint64_t addr, struct memory_region *src, 
+	struct memory_region *dst)
+{
+	uint64_t buf_addr;
+	uint64_t next_addr;
+	struct rte_mbuf *head = (struct rte_mbuf *)addr_translation(addr, src, dst);
+	struct rte_mbuf *tmp_buf;
+	
+	if(head->nb_segs < 1)
+		return NULL;
+	
+	tmp_buf = head;
+	for(int i = 0; i < head->nb_segs; i++) {
+		buf_addr = addr_translation((uint64_t)tmp_buf->buf_addr, src, dst);
+		tmp_buf->buf_addr = (void *)buf_addr;
+		next_addr = addr_translation((uint64_t)tmp_buf->next, src, dst);
+		tmp_buf->next = (struct rte_mbuf *)next_addr;
+		tmp_buf = tmp_buf->next;
+	}
+	
+	return head;
+}
+
+static uint64_t
+mbuf_addr_translation_client_tx(struct rte_mbuf* m, struct memory_region *src, 
+	struct memory_region *dst)
+{
+	if(m->nb_segs < 1)
+		return 0;
+	
+	uint64_t host_addr = addr_translation((uint64_t)m, src, dst);
+	
+	uint64_t buf_addr = 0;
+	uint64_t next_addr;
+	struct rte_mbuf *tmp_mbuf = m;
+	struct rte_mbuf *next_mbuf;
+	
+	for(int i = 0; i < m->nb_segs; i++) {
+		next_mbuf = tmp_mbuf->next;
+		buf_addr = (uint64_t)(tmp_mbuf->buf_addr);
+		buf_addr = addr_translation(buf_addr, src, dst);
+		tmp_mbuf->buf_addr = (void *)buf_addr;
+		next_addr = (uint64_t)tmp_mbuf->next;
+		next_addr = addr_translation(next_addr, src, dst);
+		tmp_mbuf->next = (struct rte_mbuf *)next_addr;
+		tmp_mbuf = next_mbuf;
+	}
+	
+	return host_addr;
+}
+
 /**
  * nb_bufs最大值设置为32767， 最高位设置为flag
  * flag = 0 时， nb_bufs为待收取的携带实际数据的包个数
@@ -924,6 +1102,7 @@ eth_zcio_client_rx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 	struct pmd_internal *internal = container_of(vq, struct pmd_internal, rx_queue);
 	struct rte_ring *data_ring = vq->data_pkt_ring;
 	struct rte_ring *free_ring = vq->free_pkt_ring;
+	struct rte_mbuf *tmp_mbuf;
 	uint64_t tmp_addr;
 	uint64_t tmp_bytes = 0;
 	uint64_t tmp_pkts = 0;
@@ -939,6 +1118,7 @@ eth_zcio_client_rx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 	if(rte_atomic16_read(&internal->attched) == 0)
 		return 0;
 	
+	// 接收空闲数据包，在client端分配数据包
 	if(nb_bufs > MAX_RX_BURST_NUM) {
 		struct zcio_msg msg = {
 			.type = ZCIO_MSG_REQUEST_PKT,
@@ -971,19 +1151,15 @@ eth_zcio_client_rx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 				ZCIO_LOG(ERR, "invalid packet address %lx", (uint64_t)bufs[i]);
 				continue;
 			}
-			// rte_mbuf转换
-			tmp_addr = addr_translation(tmp_addr, &internal->host_mem.regions[idx], 
+			tmp_mbuf = mbuf_addr_translation_client_rx(tmp_addr, &internal->host_mem.regions[idx], 
 				&internal->guest_mem.regions[idx]);
-			bufs[recv_num] = (struct rte_mbuf *)tmp_addr;
+			if(tmp_mbuf == NULL) {
+				ZCIO_LOG(ERR, "invalid packet address %lx", (uint64_t)bufs[i]);
+				continue;
+			}
 			
-			// buf_addr转换
-			tmp_addr = (uint64_t)bufs[recv_num]->buf_addr;
-			tmp_addr = addr_translation(tmp_addr, &internal->host_mem.regions[idx], 
-				&internal->guest_mem.regions[idx]);
-			bufs[recv_num]->buf_addr = (void *)tmp_addr;
-			bufs[recv_num]->dynfield1[0] = 0;
-			
-			tmp_bytes += bufs[i]->pkt_len;
+			bufs[recv_num] = tmp_mbuf;
+			tmp_bytes += bufs[recv_num]->pkt_len;
 			tmp_pkts++;
 			recv_num++;
 		}
@@ -1003,19 +1179,17 @@ eth_zcio_client_rx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 			ZCIO_LOG(ERR, "invalid packet address %lx", (uint64_t)bufs[i]);
 			continue;
 		}
-		// rte_mbuf转换
-		tmp_addr = addr_translation(tmp_addr, &internal->host_mem.regions[idx], 
+
+		tmp_mbuf = mbuf_addr_translation_client_rx(tmp_addr, &internal->host_mem.regions[idx], 
 			&internal->guest_mem.regions[idx]);
-		bufs[recv_num] = (struct rte_mbuf *)tmp_addr;
-		
-		// buf_addr转换
-		tmp_addr = (uint64_t)bufs[recv_num]->buf_addr;
-		tmp_addr = addr_translation(tmp_addr, &internal->host_mem.regions[idx], 
-			&internal->guest_mem.regions[idx]);
-		bufs[recv_num]->buf_addr = (void *)tmp_addr;
-		bufs[recv_num]->dynfield1[0] = 0;
-	
-		tmp_bytes += bufs[i]->pkt_len;
+		if(tmp_mbuf == NULL) {
+			ZCIO_LOG(ERR, "invalid packet address %lx", (uint64_t)bufs[i]);
+			continue;
+		}
+		bufs[recv_num] = tmp_mbuf;
+		if(internal->rx_csum)
+			zcio_dev_rx_sw_csum(bufs[recv_num]);
+		tmp_bytes += bufs[recv_num]->pkt_len;
 		tmp_pkts++;
 		recv_num++;
 	}
@@ -1063,16 +1237,13 @@ eth_zcio_client_tx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 					ZCIO_LOG(ERR, "invalid packet address %lx", (uint64_t)bufs[sent_bufs + i]);
 					goto out;
 				}
-				// buf_addr转换
-				host_addr = addr_translation((uint64_t)bufs[sent_bufs + i]->buf_addr, 
-					&internal->guest_mem.regions[idx], &internal->host_mem.regions[idx]);
-				bufs[sent_bufs + i]->buf_addr = (void *)host_addr;
-				
-				// rte_mbuf转换
-				host_addr = addr_translation((uint64_t)bufs[sent_bufs + i], 
+				epoch_bytes += bufs[sent_bufs + i]->pkt_len;
+				if(internal->tx_csum)
+					zcio_dev_tx_sw_csum(bufs[sent_bufs + i]);
+				host_addr = mbuf_addr_translation_client_tx(bufs[sent_bufs + i], 
 					&internal->guest_mem.regions[idx], &internal->host_mem.regions[idx]);
 				msg.payload.packets.host_start_addr[i] = host_addr;
-				epoch_bytes += bufs[sent_bufs + i]->pkt_len;
+				bufs[sent_bufs + i] = NULL;
 			}
 			zcio_send_msg(vq->sock, &msg);
 			sent_bufs += avail_bufs;
@@ -1088,16 +1259,13 @@ eth_zcio_client_tx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 				ZCIO_LOG(ERR, "invalid packet address %lx", (uint64_t)bufs[sent_bufs + i]);
 				goto out;
 			}
-			// buf_addr转换
-			host_addr = addr_translation((uint64_t)bufs[sent_bufs + i]->buf_addr, 
-				&internal->guest_mem.regions[idx], &internal->host_mem.regions[idx]);
-			bufs[sent_bufs + i]->buf_addr = (void *)host_addr;
-			
-			// rte_mbuf转换
-			host_addr = addr_translation((uint64_t)bufs[sent_bufs + i], 
-					&internal->guest_mem.regions[idx], &internal->host_mem.regions[idx]);
-			msg.payload.packets.host_start_addr[i] = host_addr;
 			epoch_bytes += bufs[sent_bufs + i]->pkt_len;
+			if(internal->tx_csum)
+				zcio_dev_tx_sw_csum(bufs[sent_bufs + i]);
+			host_addr = mbuf_addr_translation_client_tx(bufs[sent_bufs + i], 
+				&internal->guest_mem.regions[idx], &internal->host_mem.regions[idx]);
+			msg.payload.packets.host_start_addr[i] = host_addr;
+			bufs[sent_bufs + i] = NULL;
 		}
 		zcio_send_msg(vq->sock, &msg);
 		sent_bufs += ZCIO_MAX_BURST;

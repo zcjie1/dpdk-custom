@@ -76,6 +76,8 @@ struct zcio_msg {
 
 struct pmd_internal {
     bool server;
+	bool rx_csum;
+	bool tx_csum;
 	rte_atomic16_t attched; // server 和 client 已连接
     rte_atomic16_t started; // 设备已启动
     char *server_iface; // rte_malloc'd
