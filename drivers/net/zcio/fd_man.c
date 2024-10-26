@@ -230,6 +230,8 @@ fd_set_event_dispatch(void *arg)
 
 	if (pfd_set == NULL)
 		return 0;
+	
+	// static uint64_t event_num;
 
 	while (1) {
 
@@ -268,6 +270,8 @@ fd_set_event_dispatch(void *arg)
 				pthread_mutex_unlock(&pfd_set->fd_mutex);
 				continue;
 			}
+
+			// printf("Recevice %lu poll events\n", ++event_num);
 
 			remove1 = remove2 = 0;
 

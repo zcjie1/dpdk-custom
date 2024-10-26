@@ -177,6 +177,8 @@ zcio_server_msg_handler(int client_fd, void *dat, int *remove)
     struct iovec iov;
 	struct zcio_msg msg;
 	int ret = 0;
+
+	// static uint64_t msg_num;
 	
 	// 初始化msghdr结构
     memset(&msgh, 0, sizeof(msgh));
@@ -205,7 +207,9 @@ zcio_server_msg_handler(int client_fd, void *dat, int *remove)
 		
 	switch(msg.type) {
 		case ZCIO_MSG_DATA_PKT: {
+			// ZCIO_LOG(INFO, "Receive %lu msg", msg_num++);
 			uint16_t pkt_num = msg.payload.packets.pkt_num;
+			// ZCIO_LOG(INFO, "server recv %d packets\n", pkt_num);
 			uint64_t **host_addr = malloc(pkt_num * sizeof(uint64_t *));
 			for(int i = 0; i < pkt_num; i++) {
 				host_addr[i] = malloc(sizeof(uint64_t));
@@ -227,9 +231,11 @@ zcio_server_msg_handler(int client_fd, void *dat, int *remove)
 			uint16_t pkt_num = msg.payload.pkt_num;
 			ret = rte_pktmbuf_alloc_bulk(internal->mem_pool, alloc_pkts, pkt_num);
 			while(ret < 0) {
+				sleep(3);
 				ZCIO_LOG(ERR, "Fail to alloc free packet for client\n");
 				ret = rte_pktmbuf_alloc_bulk(internal->mem_pool, alloc_pkts, pkt_num);
 			}
+			// ZCIO_LOG(INFO, "alloc %d packets, \n", pkt_num);
 			response_msg.payload.packets.pkt_num = pkt_num;
 			for(int i = 0; i < pkt_num; i++) {
 				response_msg.payload.packets.host_start_addr[i] = (uint64_t)alloc_pkts[i];
@@ -244,6 +250,7 @@ zcio_server_msg_handler(int client_fd, void *dat, int *remove)
 				host_addr[i] = malloc(sizeof(uint64_t));
 				*(host_addr[i]) = msg.payload.packets.host_start_addr[i];
 			}
+			// ZCIO_LOG(INFO, "free %d packets\n", pkt_num);
 			for(int i = 0; i < pkt_num; i++) {
 				rte_pktmbuf_free((struct rte_mbuf *)*host_addr[i]);
 				free(host_addr[i]);
@@ -673,13 +680,13 @@ eth_dev_info(struct rte_eth_dev *dev,
 	dev_info->max_tx_queues = dev->data->nb_tx_queues;
 	dev_info->min_rx_bufsize = 0;
 
-	dev_info->tx_offload_capa = RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
+	// dev_info->tx_offload_capa = RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
 	
-	dev_info->tx_offload_capa |= RTE_ETH_TX_OFFLOAD_UDP_CKSUM |
-		RTE_ETH_TX_OFFLOAD_TCP_CKSUM;
+	// dev_info->tx_offload_capa |= RTE_ETH_TX_OFFLOAD_UDP_CKSUM |
+	// 	RTE_ETH_TX_OFFLOAD_TCP_CKSUM;
 	
-	dev_info->rx_offload_capa |= RTE_ETH_RX_OFFLOAD_UDP_CKSUM |
-		RTE_ETH_RX_OFFLOAD_TCP_CKSUM;
+	// dev_info->rx_offload_capa |= RTE_ETH_RX_OFFLOAD_UDP_CKSUM |
+	// 	RTE_ETH_RX_OFFLOAD_TCP_CKSUM;
 
 	return 0;
 }
@@ -840,8 +847,11 @@ zcio_send_msg(struct zcio_socket *sock, struct zcio_msg *msg)
 	msgh.msg_iovlen = 1;
 	
 	pthread_mutex_lock(&sock->mutex);
-	if(sock->sock_fd == -1)
+	if(sock->sock_fd == -1) {
+		ZCIO_LOG(ERR, "Socket is not connected");
 		return -1;
+	}
+		
 	do {
 		r = sendmsg(sock->sock_fd, &msgh, 0);
 	} while (r < 0 && errno == EINTR);
@@ -856,6 +866,10 @@ zcio_send_msg(struct zcio_socket *sock, struct zcio_msg *msg)
 static void
 zcio_dev_tx_sw_csum(struct rte_mbuf *mbuf)
 {
+	mbuf->ol_flags &= ~RTE_MBUF_F_TX_L4_MASK;
+	mbuf->ol_flags |= RTE_MBUF_F_TX_L4_NO_CKSUM;
+	return;
+	
 	uint32_t hdr_len;
 	uint16_t csum = 0, csum_offset;
 
@@ -898,6 +912,10 @@ zcio_dev_tx_sw_csum(struct rte_mbuf *mbuf)
 static void
 zcio_dev_rx_sw_csum(struct rte_mbuf *mbuf)
 {
+	mbuf->ol_flags &= ~RTE_MBUF_F_RX_L4_CKSUM_MASK;
+	mbuf->ol_flags |= RTE_MBUF_F_RX_L4_CKSUM_GOOD;
+	return;
+	
 	struct rte_net_hdr_lens hdr_lens;
 	uint32_t ptype, hdr_len;
 	uint16_t csum = 0, csum_offset;
@@ -1133,7 +1151,7 @@ eth_zcio_client_rx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 		host_addr = malloc(free_num * sizeof(uint64_t *));
 		ret = rte_ring_dequeue_bulk(free_ring, (void **)host_addr, free_num, &free_avail_num);
 		if(ret == 0) {
-			request_num = (free_num - free_avail_num) < 8 ? 8 : (free_num - free_avail_num);
+			request_num = (free_num - free_avail_num) < 16 ? 16 : (free_num - free_avail_num);
 			request_num = request_num > (MAX_FREE_QUEUE_SIZE - free_avail_num) ? 
 						(MAX_FREE_QUEUE_SIZE - free_avail_num) : 
 						request_num;
@@ -1148,16 +1166,17 @@ eth_zcio_client_rx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 			free(host_addr[i]);
 			idx = addr2idx((void *)tmp_addr, &internal->host_mem);
 			if(idx == -1) {
-				ZCIO_LOG(ERR, "invalid packet address %lx", (uint64_t)bufs[i]);
+				ZCIO_LOG(ERR, "addr2idx: rx invalid packet address %lx\n", (uint64_t)bufs[i]);
 				continue;
 			}
 			tmp_mbuf = mbuf_addr_translation_client_rx(tmp_addr, &internal->host_mem.regions[idx], 
 				&internal->guest_mem.regions[idx]);
 			if(tmp_mbuf == NULL) {
-				ZCIO_LOG(ERR, "invalid packet address %lx", (uint64_t)bufs[i]);
+				ZCIO_LOG(ERR, "addr_translation: rx invalid packet address %lx\n", (uint64_t)bufs[i]);
 				continue;
 			}
 			
+			tmp_mbuf->dynfield1[0] = 0; // 清除FREE标志位
 			bufs[recv_num] = tmp_mbuf;
 			tmp_bytes += bufs[recv_num]->pkt_len;
 			tmp_pkts++;
@@ -1176,19 +1195,19 @@ eth_zcio_client_rx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 		free(host_addr[i]);
 		idx = addr2idx((void *)tmp_addr, &internal->host_mem);
 		if(idx == -1) {
-			ZCIO_LOG(ERR, "invalid packet address %lx", (uint64_t)bufs[i]);
+			ZCIO_LOG(ERR, "addr2idx: rx invalid packet address %lx\n", (uint64_t)bufs[i]);
 			continue;
 		}
 
 		tmp_mbuf = mbuf_addr_translation_client_rx(tmp_addr, &internal->host_mem.regions[idx], 
 			&internal->guest_mem.regions[idx]);
 		if(tmp_mbuf == NULL) {
-			ZCIO_LOG(ERR, "invalid packet address %lx", (uint64_t)bufs[i]);
+			ZCIO_LOG(ERR, "addr_translation: rx invalid packet address %lx\n", (uint64_t)bufs[i]);
 			continue;
 		}
 		bufs[recv_num] = tmp_mbuf;
-		if(internal->rx_csum)
-			zcio_dev_rx_sw_csum(bufs[recv_num]);
+		// if(internal->rx_csum)
+		// 	zcio_dev_rx_sw_csum(bufs[recv_num]);
 		tmp_bytes += bufs[recv_num]->pkt_len;
 		tmp_pkts++;
 		recv_num++;
@@ -1234,12 +1253,12 @@ eth_zcio_client_tx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 			for(int i = 0; i < avail_bufs; i++) {
 				idx = addr2idx((void*)bufs[sent_bufs + i], &internal->guest_mem);
 				if(idx == -1) {
-					ZCIO_LOG(ERR, "invalid packet address %lx", (uint64_t)bufs[sent_bufs + i]);
+					ZCIO_LOG(ERR, "addr2idx: tx invalid packet address %lx\n", (uint64_t)bufs[sent_bufs + i]);
 					goto out;
 				}
 				epoch_bytes += bufs[sent_bufs + i]->pkt_len;
-				if(internal->tx_csum)
-					zcio_dev_tx_sw_csum(bufs[sent_bufs + i]);
+				// if(internal->tx_csum)
+				// 	zcio_dev_tx_sw_csum(bufs[sent_bufs + i]);
 				host_addr = mbuf_addr_translation_client_tx(bufs[sent_bufs + i], 
 					&internal->guest_mem.regions[idx], &internal->host_mem.regions[idx]);
 				msg.payload.packets.host_start_addr[i] = host_addr;
@@ -1256,12 +1275,12 @@ eth_zcio_client_tx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 		for(int i = 0; i < ZCIO_MAX_BURST; i++) {
 			idx = addr2idx((void*)bufs[sent_bufs + i], &internal->guest_mem);
 			if(idx == -1) {
-				ZCIO_LOG(ERR, "invalid packet address %lx", (uint64_t)bufs[sent_bufs + i]);
+				ZCIO_LOG(ERR, "addr2idx: tx invalid packet address %lx\n", (uint64_t)bufs[sent_bufs + i]);
 				goto out;
 			}
 			epoch_bytes += bufs[sent_bufs + i]->pkt_len;
-			if(internal->tx_csum)
-				zcio_dev_tx_sw_csum(bufs[sent_bufs + i]);
+			// if(internal->tx_csum)
+			// 	zcio_dev_tx_sw_csum(bufs[sent_bufs + i]);
 			host_addr = mbuf_addr_translation_client_tx(bufs[sent_bufs + i], 
 				&internal->guest_mem.regions[idx], &internal->host_mem.regions[idx]);
 			msg.payload.packets.host_start_addr[i] = host_addr;

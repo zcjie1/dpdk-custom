@@ -40,7 +40,7 @@ struct meminfo {
 };
 
 #define MAX_NAME_LEN 64
-#define MAX_FREE_QUEUE_SIZE	32
+#define MAX_FREE_QUEUE_SIZE	64
 struct zcio_queue {
 	struct zcio_socket *sock;
 	char *data_ring_name; // malloc'd
