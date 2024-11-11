@@ -9,7 +9,5 @@ endif
 
 sources += files(
         'zcio.c',
-        'utils.c',
-        'fd_man.c',
 )
 deps += ['kvargs', 'bus_vdev', 'ethdev']
