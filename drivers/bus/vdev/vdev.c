@@ -498,28 +498,28 @@ vdev_scan(void)
 		return -1;
 	}
 
-	if (rte_eal_process_type() == RTE_PROC_SECONDARY) {
-		struct rte_mp_msg mp_req, *mp_rep;
-		struct rte_mp_reply mp_reply;
-		struct timespec ts = {.tv_sec = 5, .tv_nsec = 0};
-		struct vdev_param *req = (struct vdev_param *)mp_req.param;
-		struct vdev_param *resp;
+	// if (rte_eal_process_type() == RTE_PROC_SECONDARY) {
+	// 	struct rte_mp_msg mp_req, *mp_rep;
+	// 	struct rte_mp_reply mp_reply;
+	// 	struct timespec ts = {.tv_sec = 5, .tv_nsec = 0};
+	// 	struct vdev_param *req = (struct vdev_param *)mp_req.param;
+	// 	struct vdev_param *resp;
 
-		strlcpy(mp_req.name, VDEV_MP_KEY, sizeof(mp_req.name));
-		mp_req.len_param = sizeof(*req);
-		mp_req.num_fds = 0;
-		req->type = VDEV_SCAN_REQ;
-		if (rte_mp_request_sync(&mp_req, &mp_reply, &ts) == 0 &&
-		    mp_reply.nb_received == 1) {
-			mp_rep = &mp_reply.msgs[0];
-			resp = (struct vdev_param *)mp_rep->param;
-			VDEV_LOG(INFO, "Received %d vdevs", resp->num);
-			free(mp_reply.msgs);
-		} else
-			VDEV_LOG(ERR, "Failed to request vdev from primary");
+	// 	strlcpy(mp_req.name, VDEV_MP_KEY, sizeof(mp_req.name));
+	// 	mp_req.len_param = sizeof(*req);
+	// 	mp_req.num_fds = 0;
+	// 	req->type = VDEV_SCAN_REQ;
+	// 	if (rte_mp_request_sync(&mp_req, &mp_reply, &ts) == 0 &&
+	// 	    mp_reply.nb_received == 1) {
+	// 		mp_rep = &mp_reply.msgs[0];
+	// 		resp = (struct vdev_param *)mp_rep->param;
+	// 		VDEV_LOG(INFO, "Received %d vdevs", resp->num);
+	// 		free(mp_reply.msgs);
+	// 	} else
+	// 		VDEV_LOG(ERR, "Failed to request vdev from primary");
 
-		/* Fall through to allow private vdevs in secondary process */
-	}
+	// 	/* Fall through to allow private vdevs in secondary process */
+	// }
 
 scan:
 	/* call custom scan callbacks if any */

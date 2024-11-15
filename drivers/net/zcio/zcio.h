@@ -87,11 +87,17 @@ struct zcio_info {
 	char txq_name[MAX_QUEUES_NUM][MAX_QUEUES_NAME_LEN];
 };
 
+struct zcio_ring {
+	uint8_t qid;
+	struct pmd_internal *internal;
+	struct rte_ring *ring; // rte_ring_create'd
+};
+
 struct zcio_queue {
 	uint64_t *queues_mask;
 	uint64_t pkt_num[MAX_QUEUES_NUM];
 	uint64_t bytes_num[MAX_QUEUES_NUM];
-	struct rte_ring *ring[MAX_QUEUES_NUM]; // rte_ring_create'd
+	struct zcio_ring zring[MAX_QUEUES_NUM]; 
 };
 
 struct pmd_internal {
@@ -102,6 +108,7 @@ struct pmd_internal {
 	uint16_t max_queues;
 	struct rte_mempool *mempool;
     char *info_name; // rte_malloc'd
+	const struct rte_memzone *info_zone;
 	struct zcio_info *info;
 	struct zcio_queue rx_queue;
 	struct zcio_queue tx_queue;

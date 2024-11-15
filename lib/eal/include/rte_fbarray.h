@@ -38,7 +38,7 @@ extern "C" {
 
 #include <rte_rwlock.h>
 
-#define RTE_FBARRAY_NAME_LEN 64
+#define RTE_FBARRAY_NAME_LEN 128
 
 struct rte_fbarray {
 	char name[RTE_FBARRAY_NAME_LEN]; /**< name associated with an array */
