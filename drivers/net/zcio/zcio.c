@@ -311,7 +311,7 @@ eth_rx_queue_setup(struct rte_eth_dev *dev, uint16_t rx_queue_id,
 	if(internal->server) {
 		snprintf(info->rxq_name[rx_queue_id], MAX_QUEUES_NAME_LEN, "zcio_rxq%u", rxq_count++);
 		vq->zring[rx_queue_id].ring = rte_ring_create(info->rxq_name[rx_queue_id], 
-			nb_rx_desc, socket_id, RING_F_SP_ENQ |RING_F_SC_DEQ);
+			nb_rx_desc, socket_id, RING_F_SP_ENQ | RING_F_SC_DEQ);
 		vq->zring[rx_queue_id].internal = internal;
 		vq->zring[rx_queue_id].qid = rx_queue_id;
 		set_bit(&info->rxq_mask, rx_queue_id);
@@ -346,7 +346,7 @@ eth_tx_queue_setup(struct rte_eth_dev *dev, uint16_t tx_queue_id,
 	if(internal->server) {
 		snprintf(info->txq_name[tx_queue_id], MAX_QUEUES_NAME_LEN, "zcio_txq%u", txq_count++);
 		vq->zring[tx_queue_id].ring = rte_ring_create(info->txq_name[tx_queue_id], 
-			nb_tx_desc, socket_id, RING_F_SP_ENQ |RING_F_SC_DEQ);
+			nb_tx_desc, socket_id, RING_F_SP_ENQ | RING_F_SC_DEQ);
 		vq->zring[tx_queue_id].internal = internal;
 		vq->zring[tx_queue_id].qid = tx_queue_id;
 		set_bit(&info->txq_mask, tx_queue_id);
@@ -613,19 +613,22 @@ eth_zcio_tx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 	if(!info->attached)
 		return 0;
 	
+	// uint64_t buf_addr[] = (uint64_t *)malloc(sizeof(uint64_t) * nb_bufs);
 	unsigned int sent_num;
 	uint64_t total_bytes = 0;
 
+	// for(uint16_t i = 0; i < nb_bufs; i++) {
+	// 	buf_addr[i] = (uint64_t)bufs[i]->buf_addr;
+	// }
 	sent_num = rte_ring_enqueue_burst(vq->ring, (void **)bufs, nb_bufs, NULL);
 	for(uint16_t i = 0; i < sent_num; i++) {
 		total_bytes += bufs[i]->pkt_len;
 	}
-	for(uint16_t i = sent_num; i < nb_bufs; i++) {
-		rte_pktmbuf_free(bufs[i]);
-	}
 	
 	internal->tx_queue.pkt_num[vq->qid] += sent_num;
 	internal->tx_queue.bytes_num[vq->qid] += total_bytes;
+
+	// free(buf_addr);
 	
 	return sent_num;
 }
