@@ -187,6 +187,8 @@ eth_dev_start(struct rte_eth_dev *eth_dev)
 		info->valid_info = true;
 	else
 		info->attached = true;
+	
+	eth_dev->data->dev_link.link_status = RTE_ETH_LINK_UP;
 
 	return 0;
 }
@@ -208,6 +210,8 @@ eth_dev_stop(struct rte_eth_dev *dev)
 	
 	if(!internal->server)
 		info->attached = false;
+	
+	dev->data->dev_link.link_status = RTE_ETH_LINK_DOWN;
 
 	return 0;
 }
