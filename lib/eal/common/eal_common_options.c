@@ -86,6 +86,7 @@ eal_long_options[] = {
 	{OPT_NO_HPET,           0, NULL, OPT_NO_HPET_NUM          },
 	{OPT_NO_HUGE,           0, NULL, OPT_NO_HUGE_NUM          },
 	{OPT_NO_PCI,            0, NULL, OPT_NO_PCI_NUM           },
+	{OPT_NO_SHVDEV,         0, NULL, OPT_NO_SHVDEV_NUM        },
 	{OPT_NO_SHCONF,         0, NULL, OPT_NO_SHCONF_NUM        },
 	{OPT_IN_MEMORY,         0, NULL, OPT_IN_MEMORY_NUM        },
 	{OPT_DEV_BLOCK,         1, NULL, OPT_DEV_BLOCK_NUM        },

@@ -47,6 +47,7 @@ typedef void (*rte_dev_event_cb_fn)(const char *device_name,
 enum rte_dev_policy {
 	RTE_DEV_ALLOWED,
 	RTE_DEV_BLOCKED,
+	RTE_DEV_NOSHARE,
 };
 
 /**

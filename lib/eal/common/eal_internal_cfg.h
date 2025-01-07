@@ -62,6 +62,7 @@ struct internal_config {
 	volatile unsigned vmware_tsc_map; /**< true to use VMware TSC mapping
 										* instead of native TSC */
 	volatile unsigned no_shconf;      /**< true if there is no shared config */
+	volatile unsigned no_shvdev;	/**< true to disable shared vdev */
 	volatile unsigned in_memory;
 	/**< true if DPDK should operate entirely in-memory and not create any
 	 * shared files or runtime data.

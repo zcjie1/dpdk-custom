@@ -323,6 +323,7 @@ rte_devargs_insert(struct rte_devargs **da)
 int
 rte_devargs_add(enum rte_devtype devtype, const char *devargs_str)
 {
+	struct internal_config *internal_cfg = eal_get_internal_configuration();
 	struct rte_devargs *devargs = NULL;
 	struct rte_bus *bus = NULL;
 	const char *dev = devargs_str;
@@ -338,6 +339,8 @@ rte_devargs_add(enum rte_devtype devtype, const char *devargs_str)
 	bus = devargs->bus;
 	if (devargs->type == RTE_DEVTYPE_BLOCKED)
 		devargs->policy = RTE_DEV_BLOCKED;
+	if(internal_cfg->no_shvdev && devargs->type == RTE_DEVTYPE_VIRTUAL)
+		devargs->policy = RTE_DEV_NOSHARE;
 	if (bus->conf.scan_mode == RTE_BUS_SCAN_UNDEFINED) {
 		if (devargs->policy == RTE_DEV_ALLOWED)
 			bus->conf.scan_mode = RTE_BUS_SCAN_ALLOWLIST;
