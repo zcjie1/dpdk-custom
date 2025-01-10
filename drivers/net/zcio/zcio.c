@@ -229,23 +229,21 @@ eth_dev_close(struct rte_eth_dev *dev)
 	eth_dev_stop(dev);
 
 	// 清空 rx_ring 中的元素
-	for(int i = 0; i < MAX_QUEUES_NUM; i++) {
+	for(int i = 0; i < internal->max_queues; i++) {
 		struct rte_ring *ring = internal->rx_queue.zring[i].ring;
+		if(ring == NULL)
+			continue;
 		while(rte_ring_dequeue(ring, (void **)&pkt) == 0) {
 			rte_pktmbuf_free(pkt);
 		}
 	}
-	
-	for(int i = 0; i < MAX_QUEUES_NUM; i++) {
+
+	for(int i = 0; i < internal->max_queues; i++) {
 		eth_rx_queue_release(dev, (uint16_t)i);
 	}
 
-	rte_free(dev->data->mac_addrs);
 	rte_free(internal->info_name);
-	rte_free(internal);
 	rte_memzone_free(internal->info_zone);
-
-	dev->data->dev_private = NULL;
 
 	return 0;
 }
@@ -374,7 +372,7 @@ eth_rx_queue_release(struct rte_eth_dev *dev, uint16_t qid)
 	struct zcio_queue *vq = &internal->rx_queue;
 
 	lock_mutex(&info->lock);
-	if(is_bit_set(*vq->queues_mask, qid)) {
+	if(is_bit_set(*vq->queues_mask, qid) && vq->zring[qid].ring != NULL) {
 		rte_ring_free(vq->zring[qid].ring);
 		vq->zring[qid].ring = NULL;
 		vq->zring[qid].internal = NULL;
@@ -656,7 +654,7 @@ eth_dev_zcio_create(struct rte_vdev_device *dev, int server, int queues,
 	struct rte_ether_addr *eth_addr = NULL;
 
 	/* reserve an ethdev entry */
-	eth_dev = rte_eth_vdev_allocate(dev, sizeof(*internal));
+	eth_dev = rte_eth_vdev_allocate(dev, sizeof(struct pmd_internal));
 	if (eth_dev == NULL)
 		goto error;
 	data = eth_dev->data;
