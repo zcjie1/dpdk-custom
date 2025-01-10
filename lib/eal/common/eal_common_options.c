@@ -1809,6 +1809,10 @@ eal_parse_common_option(int opt, const char *optarg,
 	case OPT_NO_SHCONF_NUM:
 		conf->no_shconf = 1;
 		break;
+	
+	case OPT_NO_SHVDEV_NUM:
+		conf->no_shvdev = 1;
+		break;
 
 	case OPT_IN_MEMORY_NUM:
 		conf->in_memory = 1;
